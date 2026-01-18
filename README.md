@@ -46,8 +46,8 @@
     ```
 
 ---
-@hheshanj
-I hate python and definitely doesn't use arch
+
+> I hate python and definitely doesn't use arch
 
 ---
 *Disclaimer: This project is for educational purposes and personal use. Always keep a backup of your master salt and key files in a separate secure location.*
