@@ -3,15 +3,23 @@ import cv2
 import time
 import json
 import string
-import random
+import secrets
 import threading
 import io
 import atexit
 import shutil
+import logging
+import hashlib
+import base64
 from pathlib import Path
 from datetime import datetime
+from typing import Optional, Callable, Dict, List, Tuple, Any
+from dataclasses import dataclass, asdict
+from logging.handlers import RotatingFileHandler
 from deepface import DeepFace
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import customtkinter as ctk
 from tkinter import filedialog
 from PIL import Image
@@ -23,18 +31,92 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 APP_NAME = "M3-VAULT"
-VERSION = "2.1.0"
-VAULT_DIR = Path("vault_storage")
-INTRUDER_DIR = Path("intruders")
-TEMP_DIR = Path(".vault_temp")
-KEY_FILE = "master.key"
-MASTER_FACE = "master_face.jpg"
-PASSWORDS_DB = "passwords.vault"
-SETTINGS_FILE = "settings.json"
+VERSION = "2.2.0"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class AppConfig:
+    """Application configuration with defaults"""
+    vault_dir: str = "vault_storage"
+    intruder_dir: str = "intruders"
+    temp_dir: str = ".vault_temp"
+    key_file: str = "master.key"
+    salt_file: str = "master.salt"
+    master_face: str = "master_face.jpg"
+    master_pin_hash: str = "master.pin"
+    passwords_db: str = "passwords.vault"
+    settings_file: str = "settings.json"
+    log_file: str = "vault.log"
+    
+    auto_lock_minutes: int = 5
+    clipboard_timeout: int = 30
+    max_failed_attempts: int = 3
+    secure_delete_passes: int = 3
+    preview_visible: bool = True
+    
+    @classmethod
+    def load(cls, config_file: str = "config.json") -> 'AppConfig':
+        """Load configuration from file or use defaults"""
+        if os.path.exists(config_file):
+            try:
+                with open(config_file) as f:
+                    data = json.load(f)
+                    return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
+            except Exception:
+                pass
+        return cls()
+    
+    def save(self, config_file: str = "config.json") -> None:
+        """Save configuration to file"""
+        try:
+            with open(config_file, "w") as f:
+                json.dump(asdict(self), f, indent=2)
+        except Exception:
+            pass
+
+
+config = AppConfig.load()
 
 # Create directories
-for directory in [VAULT_DIR, INTRUDER_DIR, TEMP_DIR]:
-    directory.mkdir(exist_ok=True)
+for directory in [config.vault_dir, config.intruder_dir, config.temp_dir]:
+    Path(directory).mkdir(exist_ok=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGGING SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+def setup_logging() -> logging.Logger:
+    """Configure application logging with rotation"""
+    logger = logging.getLogger('M3-VAULT')
+    logger.setLevel(logging.INFO)
+    
+    # Avoid duplicate handlers
+    if logger.handlers:
+        return logger
+    
+    # File handler with rotation (10MB max, 5 backups)
+    file_handler = RotatingFileHandler(
+        config.log_file,
+        maxBytes=10*1024*1024,
+        backupCount=5
+    )
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(file_handler)
+    
+    # Console handler for development
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter('%(levelname)s - %(message)s'))
+    logger.addHandler(console_handler)
+    
+    return logger
+
+
+logger = setup_logging()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -52,19 +134,19 @@ class M3:
     SURFACE_CONTAINER_HIGH = "#2D333B"
     SURFACE_BRIGHT = "#373E47"
     
-    # Primary Palette (Cyan/Sky)
+    # Primary Palette
     PRIMARY = "#58A6FF"
     PRIMARY_VARIANT = "#79C0FF"
     PRIMARY_CONTAINER = "#0D419D"
     ON_PRIMARY = "#002D6D"
     ON_PRIMARY_CONTAINER = "#D6E3FF"
     
-    # Secondary Palette (Purple)
+    # Secondary Palette
     SECONDARY = "#BC8CFF"
     SECONDARY_CONTAINER = "#4A2F82"
     ON_SECONDARY = "#2D0A5E"
     
-    # Tertiary Palette (Pink)
+    # Tertiary Palette
     TERTIARY = "#FF7EB3"
     TERTIARY_CONTAINER = "#6D2B49"
     
@@ -93,7 +175,7 @@ class M3:
     OUTLINE_VARIANT = "#21262D"
     DIVIDER = "#21262D"
     
-    # Typography - Using system fonts with fallbacks
+    # Typography
     FONT_DISPLAY = ("SF Pro Display", "Segoe UI", "Helvetica Neue", "Arial")
     FONT_BODY = ("SF Pro Text", "Segoe UI", "Helvetica Neue", "Arial")
     FONT_MONO = ("SF Mono", "Cascadia Code", "Consolas", "monospace")
@@ -110,118 +192,233 @@ class M3:
 # SETTINGS MANAGER
 # ══════════════════════════════════════════════════════════════════════════════
 class SettingsManager:
-    """Manages application settings"""
+    """Manages application settings with atomic saves"""
     
     DEFAULT_SETTINGS = {
         "preview_visible": True,
         "auto_lock_minutes": 5,
-        "clipboard_timeout": 30
+        "clipboard_timeout": 30,
+        "theme": "dark"
     }
     
     def __init__(self, settings_file: str):
         self.settings_file = settings_file
         self.settings = self._load_settings()
+        self._lock = threading.Lock()
     
     def _load_settings(self) -> dict:
         if os.path.exists(self.settings_file):
             try:
                 with open(self.settings_file, "r") as f:
                     loaded = json.load(f)
-                    # Merge with defaults
                     return {**self.DEFAULT_SETTINGS, **loaded}
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to load settings: {e}")
         return self.DEFAULT_SETTINGS.copy()
     
     def save(self) -> None:
-        try:
-            with open(self.settings_file, "w") as f:
-                json.dump(self.settings, f, indent=2)
-        except:
-            pass
+        """Atomically save settings to prevent corruption"""
+        with self._lock:
+            try:
+                temp_file = f"{self.settings_file}.tmp"
+                with open(temp_file, "w") as f:
+                    json.dump(self.settings, f, indent=2)
+                
+                # Atomic replace
+                if os.path.exists(self.settings_file):
+                    backup = f"{self.settings_file}.backup"
+                    shutil.copy2(self.settings_file, backup)
+                
+                shutil.move(temp_file, self.settings_file)
+                logger.info("Settings saved successfully")
+            except Exception as e:
+                logger.error(f"Failed to save settings: {e}")
     
     def get(self, key: str, default=None):
         return self.settings.get(key, default)
     
-    def set(self, key: str, value) -> None:
-        self.settings[key] = value
-        self.save()
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self.settings[key] = value
+            self.save()
 
 
-# Initialize settings
-settings = SettingsManager(SETTINGS_FILE)
+settings = SettingsManager(config.settings_file)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ENCRYPTION ENGINE
+# ENHANCED ENCRYPTION ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 class CryptoEngine:
-    """Handles all encryption/decryption operations"""
+    """Handles encryption/decryption with key derivation from PIN"""
     
-    def __init__(self, key_file: str):
+    def __init__(self, key_file: str, salt_file: str):
         self.key_file = key_file
-        self.cipher = self._initialize_cipher()
+        self.salt_file = salt_file
+        self._cipher: Optional[Fernet] = None
+        self._lock = threading.Lock()
     
-    def _initialize_cipher(self) -> Fernet:
-        if not os.path.exists(self.key_file):
-            key = Fernet.generate_key()
-            with open(self.key_file, "wb") as f:
-                f.write(key)
+    def _get_or_create_salt(self) -> bytes:
+        """Get existing salt or create new one"""
+        if os.path.exists(self.salt_file):
+            with open(self.salt_file, "rb") as f:
+                return f.read()
         else:
-            with open(self.key_file, "rb") as f:
-                key = f.read()
-        return Fernet(key)
+            salt = secrets.token_bytes(32)
+            with open(self.salt_file, "wb") as f:
+                f.write(salt)
+            return salt
+    
+    def derive_key_from_pin(self, pin: str) -> bytes:
+        """Derive encryption key from PIN using PBKDF2"""
+        salt = self._get_or_create_salt()
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=480000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(pin.encode()))
+        return key
+    
+    def initialize_with_pin(self, pin: str) -> bool:
+        """Initialize cipher with PIN"""
+        try:
+            with self._lock:
+                key = self.derive_key_from_pin(pin)
+                self._cipher = Fernet(key)
+                logger.info("Cipher initialized with PIN")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to initialize cipher: {e}")
+            return False
+    
+    def set_master_pin(self, pin: str) -> bool:
+        """Set the master PIN (hashed)"""
+        try:
+            pin_hash = hashlib.sha256(pin.encode()).hexdigest()
+            with open(config.master_pin_hash, "w") as f:
+                f.write(pin_hash)
+            self.initialize_with_pin(pin)
+            logger.info("Master PIN set successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set master PIN: {e}")
+            return False
+    
+    def verify_pin(self, pin: str) -> bool:
+        """Verify PIN against stored hash"""
+        if not os.path.exists(config.master_pin_hash):
+            return False
+        
+        try:
+            with open(config.master_pin_hash, "r") as f:
+                stored_hash = f.read().strip()
+            pin_hash = hashlib.sha256(pin.encode()).hexdigest()
+            return secrets.compare_digest(pin_hash, stored_hash)
+        except Exception as e:
+            logger.error(f"PIN verification error: {e}")
+            return False
+    
+    def is_initialized(self) -> bool:
+        """Check if cipher is ready"""
+        return self._cipher is not None
     
     def encrypt(self, data: bytes) -> bytes:
-        return self.cipher.encrypt(data)
+        """Encrypt data"""
+        if not self._cipher:
+            raise RuntimeError("Cipher not initialized")
+        return self._cipher.encrypt(data)
     
     def decrypt(self, data: bytes) -> bytes:
-        return self.cipher.decrypt(data)
+        """Decrypt data"""
+        if not self._cipher:
+            raise RuntimeError("Cipher not initialized")
+        return self._cipher.decrypt(data)
     
     def encrypt_file(self, source: str, dest: str) -> None:
+        """Encrypt file"""
         with open(source, "rb") as f:
             data = f.read()
         with open(dest, "wb") as f:
             f.write(self.encrypt(data))
+        logger.info(f"Encrypted: {source} -> {dest}")
     
     def decrypt_file(self, source: str, dest: str) -> None:
+        """Decrypt file"""
         with open(source, "rb") as f:
             data = f.read()
         with open(dest, "wb") as f:
             f.write(self.decrypt(data))
+        logger.info(f"Decrypted: {source} -> {dest}")
 
 
-# Initialize crypto engine
-crypto = CryptoEngine(KEY_FILE)
+crypto = CryptoEngine(config.key_file, config.salt_file)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UTILITY FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
-def generate_password(length: int = 20, use_symbols: bool = True) -> str:
-    """Generate a cryptographically secure password"""
-    characters = string.ascii_letters + string.digits
+def generate_password(
+    length: int = 20,
+    use_symbols: bool = True,
+    use_uppercase: bool = True,
+    use_numbers: bool = True
+) -> str:
+    """Generate a cryptographically secure password with guaranteed complexity"""
+    chars = string.ascii_lowercase
+    password = []
+    
+    if use_uppercase:
+        chars += string.ascii_uppercase
+        password.append(secrets.choice(string.ascii_uppercase))
+    
+    if use_numbers:
+        chars += string.digits
+        password.append(secrets.choice(string.digits))
+    
     if use_symbols:
-        characters += "!@#$%^&*()_+-=[]{}|;:,.<>?"
-    return ''.join(random.SystemRandom().choice(characters) for _ in range(length))
+        symbols = "!@#$%^&*()_+-=[]{}|;:,.<>?"
+        chars += symbols
+        password.append(secrets.choice(symbols))
+    
+    # Fill remaining length
+    password.extend(secrets.choice(chars) for _ in range(length - len(password)))
+    
+    # Shuffle to avoid predictable patterns
+    secrets.SystemRandom().shuffle(password)
+    
+    logger.info(f"Generated secure password of length {length}")
+    return ''.join(password)
 
 
-def secure_delete(path: Path, passes: int = 3) -> None:
+def secure_delete(path: Path, passes: Optional[int] = None) -> None:
     """Securely delete a file by overwriting with random data"""
     if not path.exists():
         return
     
+    passes = passes if passes is not None else config.secure_delete_passes
     size = path.stat().st_size
-    with open(path, "r+b") as f:
-        for _ in range(passes):
-            f.seek(0)
-            f.write(os.urandom(size))
-            f.flush()
-            os.fsync(f.fileno())
-    path.unlink()
+    
+    try:
+        with open(path, "r+b") as f:
+            for i in range(passes):
+                f.seek(0)
+                f.write(os.urandom(size))
+                f.flush()
+                os.fsync(f.fileno())
+        path.unlink()
+        logger.info(f"Securely deleted: {path}")
+    except Exception as e:
+        logger.error(f"Secure delete failed for {path}: {e}")
+        # Fallback to normal deletion
+        try:
+            path.unlink()
+        except:
+            pass
 
 
-def format_file_size(size: int) -> str:
+def format_file_size(size: float) -> str:
     """Format file size in human-readable format"""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size < 1024:
@@ -237,9 +434,14 @@ def format_timestamp(ts: float) -> str:
 
 def cleanup_temp_directory() -> None:
     """Clean up temporary files on exit"""
-    if TEMP_DIR.exists():
-        shutil.rmtree(TEMP_DIR, ignore_errors=True)
-        TEMP_DIR.mkdir(exist_ok=True)
+    temp_path = Path(config.temp_dir)
+    if temp_path.exists():
+        try:
+            for file in temp_path.iterdir():
+                secure_delete(file, passes=1)  # Quick wipe on exit
+            logger.info("Temp directory cleaned up")
+        except Exception as e:
+            logger.error(f"Cleanup failed: {e}")
 
 
 atexit.register(cleanup_temp_directory)
@@ -254,28 +456,39 @@ class Toast(ctk.CTkFrame):
     def __init__(self, parent, message: str, toast_type: str = "info", duration: int = 3500):
         super().__init__(parent, corner_radius=M3.RADIUS_MEDIUM)
         
-        # Color mapping
         color_map = {
-            "info": (M3.PRIMARY_CONTAINER, M3.PRIMARY, "ℹ"),
-            "success": (M3.SUCCESS_CONTAINER, M3.SUCCESS, "✓"),
-            "error": (M3.ERROR_CONTAINER, M3.ERROR, "✕"),
-            "warning": (M3.WARNING_CONTAINER, M3.WARNING, "⚠")
+            "info": (M3.PRIMARY_CONTAINER, M3.PRIMARY, "ℹ️"),
+            "success": (M3.SUCCESS_CONTAINER, M3.SUCCESS, "✅"),
+            "error": (M3.ERROR_CONTAINER, M3.ERROR, "❌"),
+            "warning": (M3.WARNING_CONTAINER, M3.WARNING, "⚠️")
         }
         
         bg_color, text_color, icon = color_map.get(toast_type, color_map["info"])
         
         self.configure(fg_color=bg_color, border_width=1, border_color=text_color)
         
-        # Content
+        # Content container with proper padding
         content = ctk.CTkFrame(self, fg_color="transparent")
-        content.pack(padx=16, pady=10)
+        content.pack(padx=20, pady=12, fill="x")
         
+        # Icon with fixed alignment
+        icon_label = ctk.CTkLabel(
+            content,
+            text=icon,
+            font=(M3.FONT_BODY[0], 16),
+            width=24,
+            anchor="center"
+        )
+        icon_label.pack(side="left", padx=(0, 10))
+        
+        # Message
         ctk.CTkLabel(
             content,
-            text=f"{icon}   {message}",
+            text=message,
             font=(M3.FONT_BODY[0], 13, "bold"),
-            text_color=text_color
-        ).pack()
+            text_color=text_color,
+            anchor="w"
+        ).pack(side="left", fill="x", expand=True)
         
         # Position and animate
         self.place(relx=0.5, rely=0.92, anchor="center")
@@ -285,7 +498,10 @@ class Toast(ctk.CTkFrame):
         self.after(duration, self._fade_out)
     
     def _fade_out(self):
-        self.destroy()
+        try:
+            self.destroy()
+        except:
+            pass
 
 
 class ModernEntry(ctk.CTkEntry):
@@ -315,23 +531,6 @@ class ModernEntry(ctk.CTkEntry):
         self.configure(border_color=M3.OUTLINE)
 
 
-class IconButton(ctk.CTkButton):
-    """Circular icon button with hover effects"""
-    
-    def __init__(self, master, icon: str, size: int = 44, **kwargs):
-        default_config = {
-            "text": icon,
-            "width": size,
-            "height": size,
-            "corner_radius": size // 2,
-            "fg_color": "transparent",
-            "hover_color": M3.SURFACE_VARIANT,
-            "font": (M3.FONT_BODY[0], size // 2)
-        }
-        default_config.update(kwargs)
-        super().__init__(master, **default_config)
-
-
 class FileCard(ctk.CTkFrame):
     """Modern file card with metadata and actions"""
     
@@ -352,21 +551,19 @@ class FileCard(ctk.CTkFrame):
         self.default_bg = M3.SURFACE
         self.hover_bg = M3.SURFACE_CONTAINER_HIGH
         
-        # Get file info
         ext = file_path.suffix.lower()
         icon = self._get_file_icon(ext)
         size = format_file_size(file_path.stat().st_size)
-        modified = format_timestamp(file_path.stat().st_mtime)
         
         # Main container
         container = ctk.CTkFrame(self, fg_color="transparent")
         container.pack(fill="x", padx=16, pady=14)
         
-        # Left section - Icon and info
+        # Left section
         left_section = ctk.CTkFrame(container, fg_color="transparent")
         left_section.pack(side="left", fill="x", expand=True)
         
-        # Icon container
+        # Icon with centered alignment
         icon_frame = ctk.CTkFrame(
             left_section, width=48, height=48,
             corner_radius=M3.RADIUS_MEDIUM,
@@ -374,10 +571,12 @@ class FileCard(ctk.CTkFrame):
         )
         icon_frame.pack(side="left", padx=(0, 14))
         icon_frame.pack_propagate(False)
+        icon_frame.grid_propagate(False)
         
         ctk.CTkLabel(
             icon_frame, text=icon,
-            font=(M3.FONT_BODY[0], 22)
+            font=(M3.FONT_BODY[0], 24),
+            anchor="center"
         ).place(relx=0.5, rely=0.5, anchor="center")
         
         # File info
@@ -404,7 +603,6 @@ class FileCard(ctk.CTkFrame):
         actions = ctk.CTkFrame(container, fg_color="transparent")
         actions.pack(side="right")
         
-        # Preview button
         ctk.CTkButton(
             actions, text="Preview", width=80, height=36,
             corner_radius=M3.RADIUS_SMALL,
@@ -415,7 +613,6 @@ class FileCard(ctk.CTkFrame):
             command=lambda: on_preview(file_path)
         ).pack(side="left", padx=4)
         
-        # Open button
         ctk.CTkButton(
             actions, text="Open", width=70, height=36,
             corner_radius=M3.RADIUS_SMALL,
@@ -426,14 +623,13 @@ class FileCard(ctk.CTkFrame):
             command=lambda: on_open(file_path)
         ).pack(side="left", padx=4)
         
-        # Delete button
         ctk.CTkButton(
-            actions, text="🗑", width=36, height=36,
+            actions, text="🗑️", width=36, height=36,
             corner_radius=M3.RADIUS_SMALL,
             fg_color=M3.ERROR_CONTAINER,
             hover_color=M3.ERROR,
             text_color=M3.ERROR,
-            font=(M3.FONT_BODY[0], 14),
+            font=(M3.FONT_BODY[0], 16),
             command=lambda: on_delete(file_path)
         ).pack(side="left", padx=4)
         
@@ -457,7 +653,7 @@ class FileCard(ctk.CTkFrame):
 
 
 class PasswordCard(ctk.CTkFrame):
-    """Password entry card with reveal, copy, and delete functionality"""
+    """Password entry card with reveal, copy, and delete"""
     
     def __init__(self, master, service: str, password: str, on_copy, on_delete, **kwargs):
         super().__init__(master, fg_color=M3.SURFACE, corner_radius=M3.RADIUS_MEDIUM, **kwargs)
@@ -465,7 +661,6 @@ class PasswordCard(ctk.CTkFrame):
         self.password = password
         self.is_revealed = False
         
-        # Container
         container = ctk.CTkFrame(self, fg_color="transparent")
         container.pack(fill="x", padx=16, pady=12)
         
@@ -473,16 +668,28 @@ class PasswordCard(ctk.CTkFrame):
         left = ctk.CTkFrame(container, fg_color="transparent")
         left.pack(side="left", fill="x", expand=True)
         
-        # Service icon and name
+        # Service header with icon
         header = ctk.CTkFrame(left, fg_color="transparent")
         header.pack(anchor="w")
         
+        # Service icon centered
+        icon_container = ctk.CTkFrame(header, fg_color="transparent", width=28)
+        icon_container.pack(side="left")
+        icon_container.pack_propagate(False)
+        
+        ctk.CTkLabel(
+            icon_container,
+            text="🌐",
+            font=(M3.FONT_BODY[0], 16),
+            anchor="center"
+        ).pack(expand=True)
+        
         ctk.CTkLabel(
             header,
-            text=f"🌐  {service}",
+            text=service,
             font=(M3.FONT_BODY[0], 14, "bold"),
             text_color=M3.TEXT_PRIMARY
-        ).pack(side="left")
+        ).pack(side="left", padx=(4, 0))
         
         # Password display
         self.password_label = ctk.CTkLabel(
@@ -500,16 +707,15 @@ class PasswordCard(ctk.CTkFrame):
         
         # Reveal button
         self.reveal_btn = ctk.CTkButton(
-            actions, text="👁", width=36, height=36,
+            actions, text="👁️", width=36, height=36,
             corner_radius=M3.RADIUS_SMALL,
             fg_color=M3.SURFACE_VARIANT,
             hover_color=M3.SURFACE_BRIGHT,
-            font=(M3.FONT_BODY[0], 14),
+            font=(M3.FONT_BODY[0], 16),
             command=self._toggle_reveal
         )
         self.reveal_btn.pack(side="left", padx=3)
         
-        # Copy button
         ctk.CTkButton(
             actions, text="Copy", width=65, height=36,
             corner_radius=M3.RADIUS_SMALL,
@@ -520,18 +726,16 @@ class PasswordCard(ctk.CTkFrame):
             command=lambda: on_copy(password)
         ).pack(side="left", padx=3)
         
-        # Delete button
         ctk.CTkButton(
-            actions, text="🗑", width=36, height=36,
+            actions, text="🗑️", width=36, height=36,
             corner_radius=M3.RADIUS_SMALL,
             fg_color=M3.ERROR_CONTAINER,
             hover_color=M3.ERROR,
             text_color=M3.ERROR,
-            font=(M3.FONT_BODY[0], 14),
+            font=(M3.FONT_BODY[0], 16),
             command=lambda: on_delete(service)
         ).pack(side="left", padx=3)
         
-        # Hover effect
         self.bind("<Enter>", lambda e: self.configure(fg_color=M3.SURFACE_CONTAINER_HIGH))
         self.bind("<Leave>", lambda e: self.configure(fg_color=M3.SURFACE))
     
@@ -542,7 +746,7 @@ class PasswordCard(ctk.CTkFrame):
             self.reveal_btn.configure(text="🙈")
         else:
             self.password_label.configure(text="•" * min(len(self.password), 20))
-            self.reveal_btn.configure(text="👁")
+            self.reveal_btn.configure(text="👁️")
 
 
 class IntruderCard(ctk.CTkFrame):
@@ -551,7 +755,6 @@ class IntruderCard(ctk.CTkFrame):
     def __init__(self, master, file_path: Path, on_view, on_delete, **kwargs):
         super().__init__(master, fg_color=M3.SURFACE, corner_radius=M3.RADIUS_MEDIUM, **kwargs)
         
-        # Extract timestamp
         try:
             ts = int(file_path.stem.split('_')[1])
             time_str = format_timestamp(ts)
@@ -565,7 +768,7 @@ class IntruderCard(ctk.CTkFrame):
         left = ctk.CTkFrame(container, fg_color="transparent")
         left.pack(side="left", fill="x", expand=True)
         
-        # Alert icon
+        # Alert icon centered
         icon_frame = ctk.CTkFrame(
             left, width=42, height=42,
             corner_radius=21,
@@ -576,7 +779,8 @@ class IntruderCard(ctk.CTkFrame):
         
         ctk.CTkLabel(
             icon_frame, text="🚨",
-            font=(M3.FONT_BODY[0], 18)
+            font=(M3.FONT_BODY[0], 20),
+            anchor="center"
         ).place(relx=0.5, rely=0.5, anchor="center")
         
         # Info
@@ -612,11 +816,12 @@ class IntruderCard(ctk.CTkFrame):
         ).pack(side="left", padx=4)
         
         ctk.CTkButton(
-            actions, text="🗑", width=34, height=34,
+            actions, text="🗑️", width=34, height=34,
             corner_radius=M3.RADIUS_SMALL,
             fg_color=M3.ERROR_CONTAINER,
             hover_color=M3.ERROR,
             text_color=M3.ERROR,
+            font=(M3.FONT_BODY[0], 16),
             command=lambda: on_delete(file_path)
         ).pack(side="left", padx=4)
 
@@ -691,7 +896,7 @@ class UploadProgressDialog(ctk.CTkToplevel):
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
-        self.protocol("WM_DELETE_WINDOW", lambda: None)  # Disable close button
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
         
         # Center on parent
         self.update()
@@ -704,11 +909,15 @@ class UploadProgressDialog(ctk.CTkToplevel):
         self.successful = 0
         self.failed = 0
         
-        # Icon
+        # Icon centered
+        icon_container = ctk.CTkFrame(self, fg_color="transparent", height=50)
+        icon_container.pack(pady=(25, 15))
+        
         ctk.CTkLabel(
-            self, text="🔐",
-            font=(M3.FONT_DISPLAY[0], 40)
-        ).pack(pady=(25, 15))
+            icon_container, text="🔐",
+            font=(M3.FONT_DISPLAY[0], 40),
+            anchor="center"
+        ).pack()
         
         # Title
         self.title_label = ctk.CTkLabel(
@@ -746,10 +955,7 @@ class UploadProgressDialog(ctk.CTkToplevel):
             text_color=M3.TEXT_TERTIARY
         )
         self.progress_text.pack()
-        
-        # Status (shown when complete)
-        self.status_frame = ctk.CTkFrame(self, fg_color="transparent")
-        
+    
     def update_progress(self, current: int, filename: str, success: bool = True):
         """Update the progress display"""
         self.current_file = current
@@ -760,7 +966,7 @@ class UploadProgressDialog(ctk.CTkToplevel):
         
         progress_value = current / self.total_files
         self.progress.set(progress_value)
-        self.file_label.configure(text=f"{'✓' if success else '✕'} {filename}")
+        self.file_label.configure(text=f"{'✅' if success else '❌'} {filename}")
         self.progress_text.configure(text=f"{current} / {self.total_files} files")
         self.update()
     
@@ -771,9 +977,9 @@ class UploadProgressDialog(ctk.CTkToplevel):
             text_color=M3.SUCCESS if self.failed == 0 else M3.WARNING
         )
         
-        status_text = f"✓ {self.successful} files encrypted successfully"
+        status_text = f"✅ {self.successful} files encrypted successfully"
         if self.failed > 0:
-            status_text += f"\n✕ {self.failed} files failed"
+            status_text += f"\n❌ {self.failed} files failed"
         
         self.file_label.configure(
             text=status_text,
@@ -782,7 +988,6 @@ class UploadProgressDialog(ctk.CTkToplevel):
         
         self.progress_text.pack_forget()
         
-        # Add close button
         ctk.CTkButton(
             self, text="Done", width=120, height=40,
             corner_radius=M3.RADIUS_MEDIUM,
@@ -811,7 +1016,6 @@ class DropZone(ctk.CTkFrame):
         self.default_border = M3.OUTLINE
         self.hover_border = M3.PRIMARY
         
-        # Make it clickable
         self.bind("<Button-1>", lambda e: on_click())
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
@@ -821,10 +1025,14 @@ class DropZone(ctk.CTkFrame):
         content.pack(expand=True, pady=30)
         content.bind("<Button-1>", lambda e: on_click())
         
-        # Icon
+        # Icon centered
+        icon_container = ctk.CTkFrame(content, fg_color="transparent", height=60)
+        icon_container.pack()
+        
         icon_label = ctk.CTkLabel(
-            content, text="📁",
-            font=(M3.FONT_DISPLAY[0], 48)
+            icon_container, text="📁",
+            font=(M3.FONT_DISPLAY[0], 48),
+            anchor="center"
         )
         icon_label.pack()
         icon_label.bind("<Button-1>", lambda e: on_click())
@@ -867,7 +1075,7 @@ class DropZone(ctk.CTkFrame):
 
 
 class PreviewPane(ctk.CTkFrame):
-    """Collapsible preview pane with close functionality"""
+    """Collapsible preview pane"""
     
     def __init__(self, master, on_close, **kwargs):
         super().__init__(
@@ -886,7 +1094,6 @@ class PreviewPane(ctk.CTkFrame):
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=16, pady=(16, 0))
         
-        # Title
         ctk.CTkLabel(
             header,
             text="PREVIEW",
@@ -948,15 +1155,10 @@ class PreviewPane(ctk.CTkFrame):
         )
         self.preview_content.pack(expand=True)
         
-        # Action buttons at bottom
-        self.action_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.action_frame.pack(fill="x", padx=16, pady=(0, 16))
-        
-        # Initially hide file info and actions
+        # Initially hide file info
         self.file_info_frame.pack_forget()
-        self.action_frame.pack_forget()
     
-    def show_preview(self, path: Path, data: bytes = None, error: str = None):
+    def show_preview(self, path: Path, data: Optional[bytes] = None, error: Optional[str] = None):
         """Display preview for a file"""
         self.current_file = path
         
@@ -1005,7 +1207,7 @@ class PreviewPane(ctk.CTkFrame):
                 )
         
         # Text preview
-        elif ext in ['.txt', '.py', '.js', '.json', '.md', '.csv', '.html', '.css', '.xml', '.log', '.ini', '.yaml', '.yml']:
+        elif ext in ['.txt', '.py', '.js', '.json', '.md', '.csv', '.html', '.css', '.xml']:
             try:
                 text = data.decode('utf-8', errors='ignore')[:3000]
                 if len(data) > 3000:
@@ -1023,8 +1225,6 @@ class PreviewPane(ctk.CTkFrame):
                     font=(M3.FONT_BODY[0], 13),
                     text_color=M3.ERROR
                 )
-        
-        # Unsupported format
         else:
             self.preview_content.configure(
                 image="",
@@ -1034,10 +1234,9 @@ class PreviewPane(ctk.CTkFrame):
             )
     
     def clear_preview(self):
-        """Clear the preview and reset to default state"""
+        """Clear the preview"""
         self.current_file = None
         self.file_info_frame.pack_forget()
-        self.action_frame.pack_forget()
         self.preview_content.configure(
             image="",
             text="Select a file to preview",
@@ -1050,7 +1249,7 @@ class PreviewPane(ctk.CTkFrame):
 # MAIN APPLICATION
 # ══════════════════════════════════════════════════════════════════════════════
 class VaultApp(ctk.CTk):
-    """Main M3-VAULT Application"""
+    """Main M3-VAULT Application with enhanced security"""
     
     def __init__(self):
         super().__init__()
@@ -1061,7 +1260,6 @@ class VaultApp(ctk.CTk):
         self.configure(fg_color=M3.BG)
         self.minsize(1100, 700)
         
-        # Configure appearance
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         
@@ -1070,17 +1268,26 @@ class VaultApp(ctk.CTk):
         self.current_tab = "files"
         self.last_activity = time.time()
         self.preview_visible = settings.get("preview_visible", True)
+        self.failed_attempts = 0
+        
+        # Thread safety
+        self.camera_lock = threading.Lock()
         
         # Show login screen
         self.show_login()
         
         # Start inactivity checker
         self._check_inactivity()
+        
+        logger.info("Application started")
     
     def _check_inactivity(self):
-        """Auto-lock after 5 minutes of inactivity"""
-        if self.is_unlocked and (time.time() - self.last_activity) > 300:
-            self.lock_vault()
+        """Auto-lock after configured minutes of inactivity"""
+        if self.is_unlocked:
+            timeout = settings.get("auto_lock_minutes", 5) * 60
+            if (time.time() - self.last_activity) > timeout:
+                logger.info("Auto-lock triggered due to inactivity")
+                self.lock_vault()
         self.after(30000, self._check_inactivity)
     
     def _reset_activity(self, event=None):
@@ -1100,11 +1307,10 @@ class VaultApp(ctk.CTk):
         self._clear_ui()
         self.is_unlocked = False
         
-        # Background pattern (subtle grid)
         bg_frame = ctk.CTkFrame(self, fg_color="transparent")
         bg_frame.place(relx=0.5, rely=0.5, anchor="center")
         
-        # Logo container
+        # Logo container with centered icon
         logo_container = ctk.CTkFrame(
             bg_frame, width=130, height=130,
             corner_radius=65,
@@ -1117,7 +1323,8 @@ class VaultApp(ctk.CTk):
         
         ctk.CTkLabel(
             logo_container, text="🔐",
-            font=(M3.FONT_DISPLAY[0], 52)
+            font=(M3.FONT_DISPLAY[0], 52),
+            anchor="center"
         ).place(relx=0.5, rely=0.5, anchor="center")
         
         # App name
@@ -1134,131 +1341,327 @@ class VaultApp(ctk.CTk):
             text_color=M3.TEXT_TERTIARY
         ).pack(pady=(0, 45))
         
-        # Auth button
-        self.auth_btn = ctk.CTkButton(
-            bg_frame,
-            text="    Unlock with Face ID    ",
+        # Check if first time setup
+        is_first_time = not os.path.exists(config.master_face) or not os.path.exists(config.master_pin_hash)
+        
+        if is_first_time:
+            self._show_setup_screen(bg_frame)
+        else:
+            self._show_auth_screen(bg_frame)
+    
+    def _show_setup_screen(self, parent):
+        """First-time setup for Face ID and PIN"""
+        ctk.CTkLabel(
+            parent,
+            text="First Time Setup",
+            font=(M3.FONT_BODY[0], 18, "bold"),
+            text_color=M3.PRIMARY
+        ).pack(pady=(0, 20))
+        
+        # PIN entry
+        pin_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        pin_frame.pack(pady=10)
+        
+        ctk.CTkLabel(
+            pin_frame,
+            text="Create a Master PIN (4-8 digits):",
+            font=(M3.FONT_BODY[0], 14),
+            text_color=M3.TEXT_SECONDARY
+        ).pack(pady=(0, 8))
+        
+        pin_entry = ModernEntry(
+            pin_frame,
+            placeholder_text="Enter PIN",
+            show="•",
+            width=250
+        )
+        pin_entry.pack()
+        
+        confirm_pin_entry = ModernEntry(
+            pin_frame,
+            placeholder_text="Confirm PIN",
+            show="•",
+            width=250
+        )
+        confirm_pin_entry.pack(pady=(8, 0))
+        
+        # Status label
+        self.setup_status = ctk.CTkLabel(
+            parent, text="",
+            font=(M3.FONT_BODY[0], 13),
+            text_color=M3.TEXT_SECONDARY
+        )
+        self.setup_status.pack(pady=15)
+        
+        # Setup button
+        def complete_setup():
+            pin = pin_entry.get().strip()
+            confirm_pin = confirm_pin_entry.get().strip()
+            
+            if not pin or not confirm_pin:
+                self.show_toast("Please enter PIN in both fields", "warning")
+                return
+            
+            if pin != confirm_pin:
+                self.show_toast("PINs do not match", "error")
+                return
+            
+            if len(pin) < 4 or len(pin) > 8 or not pin.isdigit():
+                self.show_toast("PIN must be 4-8 digits", "warning")
+                return
+            
+            # Set PIN
+            if not crypto.set_master_pin(pin):
+                self.show_toast("Failed to set PIN", "error")
+                return
+            
+            # Capture face
+            self.setup_status.configure(text="📸 Capturing your face... Look at the camera")
+            
+            def capture_face():
+                with self.camera_lock:
+                    cap = None
+                    try:
+                        cap = cv2.VideoCapture(0)
+                        if not cap.isOpened():
+                            raise RuntimeError("Camera not available")
+                        
+                        time.sleep(0.5)
+                        ret, frame = cap.read()
+                        
+                        if not ret:
+                            raise RuntimeError("Failed to capture frame")
+                        
+                        cv2.imwrite(config.master_face, frame)
+                        logger.info("Face ID registered successfully")
+                        
+                        self.after(0, lambda: self.show_toast("Setup complete!", "success"))
+                        self.after(1000, self.show_login)
+                        
+                    except Exception as e:
+                        logger.error(f"Face capture failed: {e}")
+                        self.after(0, lambda: self.show_toast(f"Camera error: {str(e)}", "error"))
+                    finally:
+                        if cap:
+                            cap.release()
+                        cv2.destroyAllWindows()
+            
+            threading.Thread(target=capture_face, daemon=True).start()
+        
+        ctk.CTkButton(
+            parent,
+            text="Complete Setup",
+            width=250, height=50,
+            corner_radius=25,
+            fg_color=M3.PRIMARY,
+            hover_color=M3.PRIMARY_VARIANT,
+            text_color=M3.ON_PRIMARY,
+            font=(M3.FONT_BODY[0], 16, "bold"),
+            command=complete_setup
+        ).pack(pady=15)
+    
+    def _show_auth_screen(self, parent):
+        """Authentication screen for existing users"""
+        # PIN entry
+        pin_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        pin_frame.pack(pady=15)
+        
+        ctk.CTkLabel(
+            pin_frame,
+            text="Enter Master PIN:",
+            font=(M3.FONT_BODY[0], 14),
+            text_color=M3.TEXT_SECONDARY
+        ).pack(pady=(0, 8))
+        
+        pin_entry = ModernEntry(
+            pin_frame,
+            placeholder_text="PIN",
+            show="•",
+            width=250
+        )
+        pin_entry.pack()
+        
+        # Status label
+        self.status_label = ctk.CTkLabel(
+            parent, text="",
+            font=(M3.FONT_BODY[0], 13),
+            text_color=M3.TEXT_SECONDARY
+        )
+        self.status_label.pack(pady=18)
+        
+        # Unlock button
+        def attempt_unlock():
+            pin = pin_entry.get().strip()
+            
+            if not pin:
+                self.show_toast("Please enter your PIN", "warning")
+                return
+            
+            if not crypto.verify_pin(pin):
+                self.failed_attempts += 1
+                logger.warning(f"Failed PIN attempt ({self.failed_attempts})")
+                
+                if self.failed_attempts >= config.max_failed_attempts:
+                    self.show_toast("Too many failed attempts. Verifying with Face ID...", "error")
+                    self._start_auth_thread(pin)
+                else:
+                    self.show_toast(f"Incorrect PIN ({self.failed_attempts}/{config.max_failed_attempts})", "error")
+                return
+            
+            # PIN correct, initialize crypto
+            if not crypto.initialize_with_pin(pin):
+                self.show_toast("Failed to initialize encryption", "error")
+                return
+            
+            # Now verify face
+            self._start_auth_thread(pin)
+        
+        # Handle Enter key
+        pin_entry.bind("<Return>", lambda e: attempt_unlock())
+        
+        self.unlock_btn = ctk.CTkButton(
+            parent,
+            text="🔓  Unlock with Face ID",
             width=300, height=60,
             corner_radius=30,
             fg_color=M3.PRIMARY,
             hover_color=M3.PRIMARY_VARIANT,
             text_color=M3.ON_PRIMARY,
             font=(M3.FONT_BODY[0], 17, "bold"),
-            command=self._start_auth_thread
+            command=attempt_unlock
         )
-        self.auth_btn.pack(pady=12)
+        self.unlock_btn.pack(pady=12)
         
-        # Status label
-        self.status_label = ctk.CTkLabel(
-            bg_frame, text="",
+        # Reset PIN option
+        reset_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        reset_frame.pack(pady=15)
+        
+        ctk.CTkLabel(
+            reset_frame,
+            text="Forgot PIN? ",
             font=(M3.FONT_BODY[0], 13),
-            text_color=M3.TEXT_SECONDARY
-        )
-        self.status_label.pack(pady=18)
+            text_color=M3.TEXT_TERTIARY
+        ).pack(side="left")
         
-        # Setup face option (if not configured)
-        if not os.path.exists(MASTER_FACE):
-            setup_frame = ctk.CTkFrame(bg_frame, fg_color="transparent")
-            setup_frame.pack(pady=15)
-            
-            ctk.CTkLabel(
-                setup_frame,
-                text="First time? ",
-                font=(M3.FONT_BODY[0], 13),
-                text_color=M3.TEXT_TERTIARY
-            ).pack(side="left")
-            
-            setup_btn = ctk.CTkButton(
-                setup_frame,
-                text="Register Face ID",
-                fg_color="transparent",
-                hover_color=M3.SURFACE_VARIANT,
-                text_color=M3.PRIMARY,
-                font=(M3.FONT_BODY[0], 13, "bold"),
-                command=self._setup_master_face
-            )
-            setup_btn.pack(side="left")
+        ctk.CTkButton(
+            reset_frame,
+            text="Reset Vault",
+            fg_color="transparent",
+            hover_color=M3.SURFACE_VARIANT,
+            text_color=M3.ERROR,
+            font=(M3.FONT_BODY[0], 13, "bold"),
+            command=self._reset_vault
+        ).pack(side="left")
     
-    def _setup_master_face(self):
-        self.status_label.configure(text="📸 Capturing your face... Look at the camera")
-        
-        def capture():
-            cap = cv2.VideoCapture(0)
-            time.sleep(0.5)  # Allow camera to warm up
-            ret, frame = cap.read()
-            cap.release()
-            
-            if ret:
-                cv2.imwrite(MASTER_FACE, frame)
-                self.after(0, lambda: self.status_label.configure(
-                    text="✓ Face ID registered successfully!",
-                    text_color=M3.SUCCESS
-                ))
-                self.after(0, lambda: self.show_toast("Face ID registered!", "success"))
-            else:
-                self.after(0, lambda: self.status_label.configure(
-                    text="✕ Camera error. Please try again.",
-                    text_color=M3.ERROR
-                ))
-        
-        threading.Thread(target=capture, daemon=True).start()
-    
-    def _start_auth_thread(self):
-        if not os.path.exists(MASTER_FACE):
-            self.show_toast("Please register Face ID first", "warning")
+    def _start_auth_thread(self, pin: str):
+        """Start face authentication in background thread"""
+        if not os.path.exists(config.master_face):
+            self.show_toast("Face ID not registered", "error")
             return
         
-        self.auth_btn.configure(state="disabled", text="   🔄  Scanning...   ")
+        self.unlock_btn.configure(state="disabled", text="🔄  Scanning...")
         self.status_label.configure(text="Look at the camera", text_color=M3.TEXT_SECONDARY)
-        threading.Thread(target=self._run_authentication, daemon=True).start()
+        threading.Thread(target=self._run_authentication, args=(pin,), daemon=True).start()
     
-    def _run_authentication(self):
-        cap = cv2.VideoCapture(0)
-        time.sleep(0.3)
-        ret, frame = cap.read()
-        cap.release()
-        
-        if not ret:
-            self.after(0, lambda: self.show_toast("Camera not available", "error"))
-            self.after(0, self._reset_auth_button)
-            return
-        
-        temp_img = TEMP_DIR / "auth_capture.jpg"
-        cv2.imwrite(str(temp_img), frame)
-        
-        try:
-            result = DeepFace.verify(
-                str(temp_img), MASTER_FACE,
-                enforce_detection=True,
-                detector_backend='opencv',
-                model_name='VGG-Face'
-            )
+    def _run_authentication(self, pin: str):
+        """Run face authentication with camera lock"""
+        with self.camera_lock:
+            cap = None
+            temp_img = None
             
-            if result['verified']:
-                self.is_unlocked = True
-                self.after(0, self.show_dashboard)
-                self.after(0, lambda: self.show_toast("Welcome back!", "success"))
-            else:
-                # Log intruder
-                intruder_file = INTRUDER_DIR / f"intruder_{int(time.time())}.jpg"
-                shutil.copy(temp_img, intruder_file)
-                self.after(0, lambda: self.show_toast("Access Denied • Intruder logged", "error"))
+            try:
+                cap = cv2.VideoCapture(0)
+                if not cap.isOpened():
+                    raise RuntimeError("Camera not available")
+                
+                time.sleep(0.3)
+                ret, frame = cap.read()
+                
+                if not ret:
+                    raise RuntimeError("Failed to capture frame")
+                
+                temp_img = Path(config.temp_dir) / f"auth_{int(time.time())}.jpg"
+                cv2.imwrite(str(temp_img), frame)
+                
+                result = DeepFace.verify(
+                    str(temp_img), config.master_face,
+                    enforce_detection=True,
+                    detector_backend='opencv',
+                    model_name='VGG-Face'
+                )
+                
+                if result['verified']:
+                    self.is_unlocked = True
+                    self.failed_attempts = 0
+                    logger.info("Authentication successful")
+                    self.after(0, self.show_dashboard)
+                    self.after(0, lambda: self.show_toast("Welcome back!", "success"))
+                else:
+                    # Log intruder
+                    intruder_file = Path(config.intruder_dir) / f"intruder_{int(time.time())}.jpg"
+                    shutil.copy(temp_img, intruder_file)
+                    logger.warning("Intruder detected and logged")
+                    self.after(0, lambda: self.show_toast("Access Denied • Intruder logged", "error"))
+                    self.after(0, self._reset_auth_button)
+                    
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Authentication error: {e}")
+                
+                if "Face" in error_msg or "detect" in error_msg.lower():
+                    self.after(0, lambda: self.show_toast("No face detected • Ensure good lighting", "warning"))
+                else:
+                    self.after(0, lambda: self.show_toast(f"Auth error: {error_msg[:50]}", "error"))
                 self.after(0, self._reset_auth_button)
                 
-        except Exception as e:
-            error_msg = str(e)
-            if "Face" in error_msg or "detect" in error_msg.lower():
-                self.after(0, lambda: self.show_toast("No face detected • Ensure good lighting", "warning"))
-            else:
-                self.after(0, lambda: self.show_toast(f"Auth error: {error_msg[:50]}", "error"))
-            self.after(0, self._reset_auth_button)
-        finally:
-            if temp_img.exists():
-                temp_img.unlink()
+            finally:
+                if cap:
+                    cap.release()
+                cv2.destroyAllWindows()
+                
+                if temp_img and temp_img.exists():
+                    try:
+                        temp_img.unlink()
+                    except:
+                        pass
     
     def _reset_auth_button(self):
-        self.auth_btn.configure(state="normal", text="    Unlock with Face ID    ")
-        self.status_label.configure(text="")
+        try:
+            self.unlock_btn.configure(state="normal", text="🔓  Unlock with Face ID")
+            self.status_label.configure(text="")
+        except:
+            pass
+    
+    def _reset_vault(self):
+        """Reset vault (WARNING: deletes all data)"""
+        def on_confirm():
+            try:
+                # Delete all vault data
+                for file in Path(config.vault_dir).iterdir():
+                    secure_delete(file, passes=1)
+                
+                # Delete auth files
+                for file in [config.master_face, config.master_pin_hash, config.key_file, 
+                            config.salt_file, config.passwords_db]:
+                    path = Path(file)
+                    if path.exists():
+                        secure_delete(path, passes=1)
+                
+                logger.info("Vault reset completed")
+                self.show_toast("Vault reset complete", "success")
+                self.after(1000, self.show_login)
+                
+            except Exception as e:
+                logger.error(f"Reset failed: {e}")
+                self.show_toast(f"Reset failed: {str(e)}", "error")
+        
+        ConfirmDialog(
+            self,
+            title="⚠️  Reset Vault?",
+            message="This will DELETE ALL vault data, passwords, and settings. This cannot be undone!",
+            on_confirm=on_confirm,
+            danger=True
+        )
     
     # ──────────────────────────────────────────────────────────────────────────
     # DASHBOARD
@@ -1270,7 +1673,7 @@ class VaultApp(ctk.CTk):
         self.bind_all("<Motion>", self._reset_activity)
         self.bind_all("<Key>", self._reset_activity)
         
-        # Sidebar navigation
+        # Sidebar
         self.sidebar = ctk.CTkFrame(
             self, width=88,
             fg_color=M3.SURFACE,
@@ -1279,19 +1682,21 @@ class VaultApp(ctk.CTk):
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
         
-        # App logo in sidebar
+        # Logo centered
         logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent", height=80)
         logo_frame.pack(fill="x")
         logo_frame.pack_propagate(False)
+        
         ctk.CTkLabel(
             logo_frame, text="🔐",
-            font=(M3.FONT_DISPLAY[0], 34)
+            font=(M3.FONT_DISPLAY[0], 34),
+            anchor="center"
         ).place(relx=0.5, rely=0.5, anchor="center")
         
         # Divider
         ctk.CTkFrame(self.sidebar, height=1, fg_color=M3.DIVIDER).pack(fill="x", padx=16)
         
-        # Navigation items
+        # Navigation
         nav_container = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         nav_container.pack(fill="x", pady=20)
         
@@ -1319,7 +1724,7 @@ class VaultApp(ctk.CTk):
         # Spacer
         ctk.CTkFrame(self.sidebar, fg_color="transparent").pack(expand=True, fill="y")
         
-        # Lock button at bottom
+        # Lock button
         ctk.CTkButton(
             self.sidebar,
             text="🔒",
@@ -1331,7 +1736,7 @@ class VaultApp(ctk.CTk):
             command=self.lock_vault
         ).pack(pady=20)
         
-        # Main content area
+        # Main content
         self.main_container = ctk.CTkFrame(
             self,
             fg_color=M3.SURFACE_CONTAINER,
@@ -1339,21 +1744,20 @@ class VaultApp(ctk.CTk):
         )
         self.main_container.pack(side="right", expand=True, fill="both", padx=20, pady=20)
         
-        # Split: Content + Preview
+        # Content area
         self.content_area = ctk.CTkFrame(self.main_container, fg_color="transparent")
         self.content_area.pack(side="left", expand=True, fill="both")
         
-        # Preview pane (collapsible)
+        # Preview pane
         self.preview_pane = PreviewPane(
             self.main_container,
             on_close=self.toggle_preview
         )
         
-        # Show/hide based on saved preference
         if self.preview_visible:
             self.preview_pane.pack(side="right", fill="y", padx=16, pady=16)
         
-        # Floating button to show preview (when hidden)
+        # Show preview button
         self.show_preview_btn = ctk.CTkButton(
             self.main_container,
             text="◀ Preview",
@@ -1369,21 +1773,18 @@ class VaultApp(ctk.CTk):
         if not self.preview_visible:
             self.show_preview_btn.place(relx=0.98, rely=0.5, anchor="e")
         
-        # Load default tab
         self.set_tab("files")
     
     def toggle_preview(self):
-        """Toggle preview pane visibility"""
+        """Toggle preview pane"""
         self.preview_visible = not self.preview_visible
         settings.set("preview_visible", self.preview_visible)
         
         if self.preview_visible:
-            # Show preview pane
             self.show_preview_btn.place_forget()
             self.preview_pane.pack(side="right", fill="y", padx=16, pady=16)
             self.show_toast("Preview panel opened", "info")
         else:
-            # Hide preview pane
             self.preview_pane.pack_forget()
             self.show_preview_btn.place(relx=0.98, rely=0.5, anchor="e")
             self.show_toast("Preview panel closed", "info")
@@ -1391,7 +1792,7 @@ class VaultApp(ctk.CTk):
     def set_tab(self, tab: str):
         self.current_tab = tab
         
-        # Update navigation states
+        # Update navigation
         for key, btn in self.nav_buttons.items():
             if key == tab:
                 btn.configure(fg_color=M3.PRIMARY_CONTAINER)
@@ -1402,11 +1803,10 @@ class VaultApp(ctk.CTk):
         for widget in self.content_area.winfo_children():
             widget.destroy()
         
-        # Clear preview when switching tabs
         if hasattr(self, 'preview_pane'):
             self.preview_pane.clear_preview()
         
-        # Render tab content
+        # Render tab
         if tab == "files":
             self._render_files_tab()
         elif tab == "passwords":
@@ -1419,6 +1819,7 @@ class VaultApp(ctk.CTk):
         self.is_unlocked = False
         self.unbind_all("<Motion>")
         self.unbind_all("<Key>")
+        logger.info("Vault locked")
         self.show_login()
         self.show_toast("Vault locked", "info")
     
@@ -1430,7 +1831,6 @@ class VaultApp(ctk.CTk):
         header = ctk.CTkFrame(self.content_area, fg_color="transparent")
         header.pack(fill="x", padx=32, pady=(28, 20))
         
-        # Title and count
         title_frame = ctk.CTkFrame(header, fg_color="transparent")
         title_frame.pack(side="left")
         
@@ -1441,7 +1841,7 @@ class VaultApp(ctk.CTk):
             text_color=M3.TEXT_PRIMARY
         ).pack(side="left")
         
-        file_count = len(list(VAULT_DIR.iterdir()))
+        file_count = len(list(Path(config.vault_dir).iterdir()))
         ctk.CTkLabel(
             title_frame,
             text=f"  ({file_count})",
@@ -1453,11 +1853,10 @@ class VaultApp(ctk.CTk):
         btn_frame = ctk.CTkFrame(header, fg_color="transparent")
         btn_frame.pack(side="right")
         
-        # Toggle preview button
         preview_btn_text = "Hide Preview" if self.preview_visible else "Show Preview"
         ctk.CTkButton(
             btn_frame,
-            text=f"👁 {preview_btn_text}",
+            text=f"👁️ {preview_btn_text}",
             width=130, height=44,
             corner_radius=22,
             fg_color=M3.SURFACE,
@@ -1467,10 +1866,9 @@ class VaultApp(ctk.CTk):
             command=self.toggle_preview
         ).pack(side="left", padx=(0, 10))
         
-        # Add multiple files button
         ctk.CTkButton(
             btn_frame,
-            text="+ Add Files",
+            text="➕ Add Files",
             width=130, height=44,
             corner_radius=22,
             fg_color=M3.PRIMARY,
@@ -1480,7 +1878,6 @@ class VaultApp(ctk.CTk):
             command=self._upload_files
         ).pack(side="left", padx=(0, 10))
         
-        # Add folder button
         ctk.CTkButton(
             btn_frame,
             text="📁 Add Folder",
@@ -1493,11 +1890,9 @@ class VaultApp(ctk.CTk):
             command=self._upload_folder
         ).pack(side="left")
         
-        files = list(VAULT_DIR.iterdir())
+        files = list(Path(config.vault_dir).iterdir())
         
-        # Show drop zone if no files, otherwise show file list
         if not files:
-            # Drop zone for empty state
             drop_zone = DropZone(
                 self.content_area,
                 on_click=self._upload_files
@@ -1537,7 +1932,6 @@ class VaultApp(ctk.CTk):
             )
             scroll.pack(expand=True, fill="both", padx=20, pady=(0, 20))
             
-            # Sort by modification time (newest first)
             for file_path in sorted(files, key=lambda x: x.stat().st_mtime, reverse=True):
                 FileCard(
                     scroll,
@@ -1548,24 +1942,11 @@ class VaultApp(ctk.CTk):
                 ).pack(fill="x", pady=6, padx=12)
     
     def _upload_files(self):
-        """Upload multiple files with progress dialog"""
-        file_paths = filedialog.askopenfilenames(
-            title="Select files to encrypt",
-            filetypes=[
-                ("All files", "*.*"),
-                ("Images", "*.jpg *.jpeg *.png *.gif *.bmp *.webp"),
-                ("Documents", "*.txt *.pdf *.doc *.docx *.rtf"),
-                ("Videos", "*.mp4 *.mov *.avi *.mkv *.webm"),
-                ("Audio", "*.mp3 *.wav *.flac *.aac *.ogg"),
-                ("Archives", "*.zip *.rar *.7z *.tar *.gz"),
-                ("Code", "*.py *.js *.html *.css *.json *.xml *.md")
-            ]
-        )
+        file_paths = filedialog.askopenfilenames(title="Select files to encrypt")
         
         if not file_paths:
             return
         
-        # Start upload in background thread
         threading.Thread(
             target=self._process_file_uploads,
             args=(file_paths,),
@@ -1573,21 +1954,18 @@ class VaultApp(ctk.CTk):
         ).start()
     
     def _upload_folder(self):
-        """Upload all files from a selected folder"""
         folder_path = filedialog.askdirectory(title="Select folder to encrypt")
         
         if not folder_path:
             return
         
-        # Get all files in folder (non-recursive)
         folder = Path(folder_path)
         file_paths = [str(f) for f in folder.iterdir() if f.is_file()]
         
         if not file_paths:
-            self.show_toast("No files found in selected folder", "warning")
+            self.show_toast("No files found in folder", "warning")
             return
         
-        # Start upload in background thread
         threading.Thread(
             target=self._process_file_uploads,
             args=(tuple(file_paths),),
@@ -1595,13 +1973,8 @@ class VaultApp(ctk.CTk):
         ).start()
     
     def _process_file_uploads(self, file_paths: tuple):
-        """Process multiple file uploads with progress tracking"""
         total_files = len(file_paths)
-        
-        # Create progress dialog on main thread
         self.after(0, lambda: self._show_upload_progress(total_files))
-        
-        # Small delay to ensure dialog is created
         time.sleep(0.1)
         
         successful = 0
@@ -1611,51 +1984,42 @@ class VaultApp(ctk.CTk):
             filename = os.path.basename(file_path)
             
             try:
-                # Check if file already exists
-                dest = VAULT_DIR / filename
+                dest = Path(config.vault_dir) / filename
                 
-                # Handle duplicate filenames
+                # Handle duplicates
                 if dest.exists():
                     name, ext = os.path.splitext(filename)
                     counter = 1
                     while dest.exists():
-                        dest = VAULT_DIR / f"{name}_{counter}{ext}"
+                        dest = Path(config.vault_dir) / f"{name}_{counter}{ext}"
                         counter += 1
                 
-                # Encrypt and save
                 crypto.encrypt_file(file_path, str(dest))
                 successful += 1
-                
-                # Update progress
                 self.after(0, lambda i=i, fn=filename: self._update_upload_progress(i, fn, True))
                 
             except Exception as e:
+                logger.error(f"Failed to encrypt {filename}: {e}")
                 failed += 1
                 self.after(0, lambda i=i, fn=filename: self._update_upload_progress(i, fn, False))
             
-            # Small delay between files for UI responsiveness
             time.sleep(0.05)
         
-        # Show completion
         self.after(0, lambda: self._complete_upload(successful, failed))
     
     def _show_upload_progress(self, total_files: int):
-        """Show the upload progress dialog"""
         self.upload_dialog = UploadProgressDialog(self, total_files)
     
     def _update_upload_progress(self, current: int, filename: str, success: bool):
-        """Update the upload progress dialog"""
         if hasattr(self, 'upload_dialog') and self.upload_dialog.winfo_exists():
             self.upload_dialog.update_progress(current, filename, success)
     
     def _complete_upload(self, successful: int, failed: int):
-        """Complete the upload process"""
         if hasattr(self, 'upload_dialog') and self.upload_dialog.winfo_exists():
             self.upload_dialog.show_complete(lambda: self.set_tab("files"))
         else:
-            # Dialog was closed, just refresh
             self.set_tab("files")
-            
+        
         if successful > 0:
             msg = f"{successful} file{'s' if successful > 1 else ''} encrypted successfully"
             if failed > 0:
@@ -1663,26 +2027,33 @@ class VaultApp(ctk.CTk):
             self.show_toast(msg, "success" if failed == 0 else "warning")
     
     def _show_file_preview(self, path: Path):
-        """Show file preview in the preview pane"""
-        # Ensure preview pane is visible
         if not self.preview_visible:
             self.toggle_preview()
         
         try:
             with open(path, "rb") as f:
                 data = crypto.decrypt(f.read())
-            
             self.preview_pane.show_preview(path, data)
-            
         except Exception as e:
+            logger.error(f"Preview failed for {path}: {e}")
             self.preview_pane.show_preview(path, error=str(e))
     
     def _open_file(self, path: Path):
         try:
-            temp_path = TEMP_DIR / f"view_{path.name}"
+            temp_path = Path(config.temp_dir) / f"view_{int(time.time())}_{path.name}"
             crypto.decrypt_file(str(path), str(temp_path))
             os.startfile(str(temp_path))
+            
+            # Schedule cleanup after 5 minutes
+            def cleanup():
+                time.sleep(300)
+                if temp_path.exists():
+                    secure_delete(temp_path, passes=1)
+            
+            threading.Thread(target=cleanup, daemon=True).start()
+            
         except Exception as e:
+            logger.error(f"Failed to open file: {e}")
             self.show_toast(f"Error opening file: {str(e)}", "error")
     
     def _delete_file(self, path: Path):
@@ -1694,7 +2065,7 @@ class VaultApp(ctk.CTk):
         
         ConfirmDialog(
             self,
-            title="🗑  Delete File?",
+            title="🗑️  Delete File?",
             message=f"This will permanently shred '{path.name}'. This action cannot be undone.",
             on_confirm=on_confirm,
             danger=True
@@ -1726,14 +2097,12 @@ class VaultApp(ctk.CTk):
         form = ctk.CTkFrame(form_container, fg_color="transparent")
         form.pack(fill="x", padx=20, pady=20)
         
-        # Service name entry
         service_entry = ModernEntry(
             form,
             placeholder_text="Service name (e.g., Gmail, Netflix)"
         )
         service_entry.pack(side="left", expand=True, fill="x", padx=(0, 10))
         
-        # Password entry
         password_entry = ModernEntry(
             form,
             placeholder_text="Password",
@@ -1741,12 +2110,11 @@ class VaultApp(ctk.CTk):
         )
         password_entry.pack(side="left", expand=True, fill="x", padx=(0, 10))
         
-        # Generate button
         def generate_and_fill():
             pwd = generate_password(20)
             password_entry.delete(0, 'end')
             password_entry.insert(0, pwd)
-            password_entry.configure(show="")  # Show generated password
+            password_entry.configure(show="")
             self.after(3000, lambda: password_entry.configure(show="•"))
         
         ctk.CTkButton(
@@ -1758,7 +2126,6 @@ class VaultApp(ctk.CTk):
             command=generate_and_fill
         ).pack(side="left", padx=(0, 10))
         
-        # Save button
         def save_password():
             service = service_entry.get().strip()
             password = password_entry.get()
@@ -1798,13 +2165,13 @@ class VaultApp(ctk.CTk):
         passwords = self._load_passwords()
         
         if not passwords:
-            # Empty state
             empty_frame = ctk.CTkFrame(scroll, fg_color="transparent")
             empty_frame.pack(expand=True, pady=60)
             
             ctk.CTkLabel(
                 empty_frame, text="🔑",
-                font=(M3.FONT_DISPLAY[0], 56)
+                font=(M3.FONT_DISPLAY[0], 56),
+                anchor="center"
             ).pack()
             
             ctk.CTkLabel(
@@ -1829,35 +2196,44 @@ class VaultApp(ctk.CTk):
                 ).pack(fill="x", pady=5, padx=12)
     
     def _load_passwords(self) -> dict:
-        """Load and decrypt passwords from storage"""
-        if not os.path.exists(PASSWORDS_DB):
+        if not os.path.exists(config.passwords_db):
             return {}
         try:
-            with open(PASSWORDS_DB, "rb") as f:
+            with open(config.passwords_db, "rb") as f:
                 encrypted_data = f.read()
             decrypted_data = crypto.decrypt(encrypted_data)
             return json.loads(decrypted_data.decode('utf-8'))
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to load passwords: {e}")
             return {}
     
     def _save_passwords(self, passwords: dict) -> None:
-        """Encrypt and save passwords to storage"""
         try:
             data = json.dumps(passwords).encode('utf-8')
             encrypted_data = crypto.encrypt(data)
-            with open(PASSWORDS_DB, "wb") as f:
+            
+            # Atomic write
+            temp_file = f"{config.passwords_db}.tmp"
+            with open(temp_file, "wb") as f:
                 f.write(encrypted_data)
+            
+            if os.path.exists(config.passwords_db):
+                shutil.copy2(config.passwords_db, f"{config.passwords_db}.backup")
+            
+            shutil.move(temp_file, config.passwords_db)
+            logger.info("Passwords saved successfully")
+            
         except Exception as e:
+            logger.error(f"Failed to save passwords: {e}")
             self.show_toast(f"Error saving: {str(e)}", "error")
     
     def _copy_to_clipboard(self, text: str) -> None:
-        """Copy text to clipboard with visual feedback"""
         self.clipboard_clear()
         self.clipboard_append(text)
         self.update()
         self.show_toast("Password copied to clipboard!", "success")
         
-        # Auto-clear clipboard after 30 seconds for security
+        # Auto-clear after timeout
         def clear_clipboard():
             try:
                 current = self.clipboard_get()
@@ -1867,10 +2243,10 @@ class VaultApp(ctk.CTk):
             except:
                 pass
         
-        self.after(30000, clear_clipboard)
+        timeout = (settings.get("clipboard_timeout") or 30) * 1000
+        self.after(timeout, clear_clipboard)
     
     def _delete_password(self, service: str) -> None:
-        """Delete a password entry with confirmation"""
         def on_confirm():
             passwords = self._load_passwords()
             if service in passwords:
@@ -1881,22 +2257,20 @@ class VaultApp(ctk.CTk):
         
         ConfirmDialog(
             self,
-            title="🗑  Delete Password?",
+            title="🗑️  Delete Password?",
             message=f"Delete the saved password for '{service}'? This cannot be undone.",
             on_confirm=on_confirm,
             danger=True
         )
     
     # ──────────────────────────────────────────────────────────────────────────
-    # SECURITY TAB (Intruder Logs)
+    # SECURITY TAB
     # ──────────────────────────────────────────────────────────────────────────
     def _render_security_tab(self):
-        """Render the security/intruder logs tab"""
         # Header
         header = ctk.CTkFrame(self.content_area, fg_color="transparent")
         header.pack(fill="x", padx=32, pady=(28, 20))
         
-        # Title and count
         title_frame = ctk.CTkFrame(header, fg_color="transparent")
         title_frame.pack(side="left")
         
@@ -1907,7 +2281,7 @@ class VaultApp(ctk.CTk):
             text_color=M3.TEXT_PRIMARY
         ).pack(side="left")
         
-        intruder_count = len(list(INTRUDER_DIR.iterdir()))
+        intruder_count = len(list(Path(config.intruder_dir).iterdir()))
         if intruder_count > 0:
             count_badge = ctk.CTkFrame(
                 title_frame,
@@ -1925,7 +2299,6 @@ class VaultApp(ctk.CTk):
                 text_color="#FFFFFF"
             ).place(relx=0.5, rely=0.5, anchor="center")
         
-        # Clear all button
         if intruder_count > 0:
             ctk.CTkButton(
                 header,
@@ -1950,10 +2323,9 @@ class VaultApp(ctk.CTk):
         stats_inner = ctk.CTkFrame(stats_frame, fg_color="transparent")
         stats_inner.pack(fill="x", padx=24, pady=20)
         
-        # Stats items
         stats_data = [
             ("🛡️", "Vault Status", "Secured" if self.is_unlocked else "Locked", M3.SUCCESS),
-            ("📁", "Protected Files", str(len(list(VAULT_DIR.iterdir()))), M3.PRIMARY),
+            ("📁", "Protected Files", str(len(list(Path(config.vault_dir).iterdir()))), M3.PRIMARY),
             ("🔑", "Saved Passwords", str(len(self._load_passwords())), M3.SECONDARY),
             ("🚨", "Intrusion Attempts", str(intruder_count), M3.ERROR if intruder_count > 0 else M3.TEXT_TERTIARY)
         ]
@@ -1964,7 +2336,8 @@ class VaultApp(ctk.CTk):
             
             ctk.CTkLabel(
                 stat_item, text=icon,
-                font=(M3.FONT_DISPLAY[0], 28)
+                font=(M3.FONT_DISPLAY[0], 28),
+                anchor="center"
             ).pack()
             
             ctk.CTkLabel(
@@ -1979,7 +2352,6 @@ class VaultApp(ctk.CTk):
                 text_color=M3.TEXT_TERTIARY
             ).pack()
         
-        # Section title for intruder logs
         if intruder_count > 0:
             ctk.CTkLabel(
                 self.content_area,
@@ -1997,16 +2369,16 @@ class VaultApp(ctk.CTk):
         )
         scroll.pack(expand=True, fill="both", padx=20, pady=(0, 20))
         
-        intruders = list(INTRUDER_DIR.iterdir())
+        intruders = list(Path(config.intruder_dir).iterdir())
         
         if not intruders:
-            # Empty state
             empty_frame = ctk.CTkFrame(scroll, fg_color="transparent")
             empty_frame.pack(expand=True, pady=50)
             
             ctk.CTkLabel(
                 empty_frame, text="✅",
-                font=(M3.FONT_DISPLAY[0], 56)
+                font=(M3.FONT_DISPLAY[0], 56),
+                anchor="center"
             ).pack()
             
             ctk.CTkLabel(
@@ -2023,7 +2395,6 @@ class VaultApp(ctk.CTk):
                 text_color=M3.TEXT_TERTIARY
             ).pack()
         else:
-            # Sort by time (newest first)
             for intruder_path in sorted(intruders, key=lambda x: x.stat().st_mtime, reverse=True):
                 IntruderCard(
                     scroll,
@@ -2033,20 +2404,20 @@ class VaultApp(ctk.CTk):
                 ).pack(fill="x", pady=5, padx=12)
     
     def _view_intruder(self, path: Path) -> None:
-        """Open intruder photo"""
         try:
             os.startfile(str(path))
         except Exception as e:
+            logger.error(f"Failed to open intruder image: {e}")
             self.show_toast(f"Error opening image: {str(e)}", "error")
     
     def _delete_intruder(self, path: Path) -> None:
-        """Delete a single intruder log"""
         def on_confirm():
             try:
                 path.unlink()
                 self.show_toast("Intruder log deleted", "success")
                 self.set_tab("security")
             except Exception as e:
+                logger.error(f"Failed to delete intruder log: {e}")
                 self.show_toast(f"Error: {str(e)}", "error")
         
         ConfirmDialog(
@@ -2058,19 +2429,19 @@ class VaultApp(ctk.CTk):
         )
     
     def _clear_all_intruders(self) -> None:
-        """Clear all intruder logs with confirmation"""
         def on_confirm():
             try:
-                for file in INTRUDER_DIR.iterdir():
+                for file in Path(config.intruder_dir).iterdir():
                     file.unlink()
                 self.show_toast("All intruder logs cleared", "success")
                 self.set_tab("security")
             except Exception as e:
+                logger.error(f"Failed to clear intruder logs: {e}")
                 self.show_toast(f"Error: {str(e)}", "error")
         
         ConfirmDialog(
             self,
-            title="🗑  Clear All Logs?",
+            title="🗑️  Clear All Logs?",
             message="This will permanently delete all intrusion attempt photos. This cannot be undone.",
             on_confirm=on_confirm,
             danger=True
@@ -2078,86 +2449,22 @@ class VaultApp(ctk.CTk):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SPLASH SCREEN
-# ══════════════════════════════════════════════════════════════════════════════
-class SplashScreen(ctk.CTkToplevel):
-    """Loading splash screen shown at startup"""
-    
-    def __init__(self, parent):
-        super().__init__(parent)
-        
-        # Window setup
-        self.title("")
-        self.geometry("400x300")
-        self.configure(fg_color=M3.BG)
-        self.overrideredirect(True)
-        self.resizable(False, False)
-        
-        # Center on screen
-        self.update_idletasks()
-        x = (self.winfo_screenwidth() - 400) // 2
-        y = (self.winfo_screenheight() - 300) // 2
-        self.geometry(f"+{x}+{y}")
-        
-        # Content
-        ctk.CTkLabel(
-            self, text="🔐",
-            font=(M3.FONT_DISPLAY[0], 72)
-        ).pack(pady=(60, 20))
-        
-        ctk.CTkLabel(
-            self, text=APP_NAME,
-            font=(M3.FONT_DISPLAY[0], 32, "bold"),
-            text_color=M3.TEXT_PRIMARY
-        ).pack()
-        
-        ctk.CTkLabel(
-            self, text="Initializing secure environment...",
-            font=(M3.FONT_BODY[0], 13),
-            text_color=M3.TEXT_TERTIARY
-        ).pack(pady=(30, 0))
-        
-        # Progress bar
-        self.progress = ctk.CTkProgressBar(
-            self,
-            width=280,
-            height=4,
-            corner_radius=2,
-            fg_color=M3.SURFACE_VARIANT,
-            progress_color=M3.PRIMARY
-        )
-        self.progress.pack(pady=25)
-        self.progress.set(0)
-        
-        # Animate progress
-        self._animate_progress(0)
-    
-    def _animate_progress(self, value: float):
-        if value <= 1.0:
-            self.progress.set(value)
-            self.after(20, lambda: self._animate_progress(value + 0.02))
-        else:
-            self.destroy()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # APPLICATION ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
     """Main entry point for M3-VAULT"""
-    # Configure CustomTkinter
-    ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("blue")
-    
-    # Create and run application
-    app = VaultApp()
-    
-    # Show splash screen (optional - uncomment if desired)
-    # splash = SplashScreen(app)
-    # app.wait_window(splash)
-    
-    # Start main loop
-    app.mainloop()
+    try:
+        # Configure CustomTkinter
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        
+        # Create and run application
+        app = VaultApp()
+        app.mainloop()
+        
+    except Exception as e:
+        logger.critical(f"Application crashed: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
