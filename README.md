@@ -15,15 +15,6 @@
 
 ---
 
-## 🛡️ Security Architecture
-
-M3-VAULT doesn't just hide files; it transforms them. 
-
-1.  **Key Derivation:** Your Master PIN is processed through **PBKDF2** (Password-Based Key Derivation Function 2) with a unique salt and 480,000 iterations of SHA-256.
-2.  **Encryption Flow:** 
-3.  **Biometric Layer:** The face recognition acts as a secondary "gatekeeper" before the derived key is used to initialize the `CryptoEngine`.
-
----
 
 ## 🛠️ Tech Stack
 
@@ -55,11 +46,7 @@ M3-VAULT doesn't just hide files; it transforms them.
     ```
 
 ---
-
-## 👨‍💻 Author
-**Heshan Jayakody**
-*First-year Cyber Security Undergraduate @ NSBM Green University*
-[Portfolio](https://hhjdev.xyz)
+@hheshanj
 I hate python and definitely doesn't use arch
 
 ---
