@@ -23,12 +23,14 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 APP_NAME = "M3-VAULT"
+VERSION = "2.1.0"
 VAULT_DIR = Path("vault_storage")
 INTRUDER_DIR = Path("intruders")
 TEMP_DIR = Path(".vault_temp")
 KEY_FILE = "master.key"
 MASTER_FACE = "master_face.jpg"
 PASSWORDS_DB = "passwords.vault"
+SETTINGS_FILE = "settings.json"
 
 # Create directories
 for directory in [VAULT_DIR, INTRUDER_DIR, TEMP_DIR]:
@@ -102,6 +104,52 @@ class M3:
     RADIUS_LARGE = 16
     RADIUS_XLARGE = 24
     RADIUS_FULL = 9999
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SETTINGS MANAGER
+# ══════════════════════════════════════════════════════════════════════════════
+class SettingsManager:
+    """Manages application settings"""
+    
+    DEFAULT_SETTINGS = {
+        "preview_visible": True,
+        "auto_lock_minutes": 5,
+        "clipboard_timeout": 30
+    }
+    
+    def __init__(self, settings_file: str):
+        self.settings_file = settings_file
+        self.settings = self._load_settings()
+    
+    def _load_settings(self) -> dict:
+        if os.path.exists(self.settings_file):
+            try:
+                with open(self.settings_file, "r") as f:
+                    loaded = json.load(f)
+                    # Merge with defaults
+                    return {**self.DEFAULT_SETTINGS, **loaded}
+            except:
+                pass
+        return self.DEFAULT_SETTINGS.copy()
+    
+    def save(self) -> None:
+        try:
+            with open(self.settings_file, "w") as f:
+                json.dump(self.settings, f, indent=2)
+        except:
+            pass
+    
+    def get(self, key: str, default=None):
+        return self.settings.get(key, default)
+    
+    def set(self, key: str, value) -> None:
+        self.settings[key] = value
+        self.save()
+
+
+# Initialize settings
+settings = SettingsManager(SETTINGS_FILE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -631,6 +679,373 @@ class ConfirmDialog(ctk.CTkToplevel):
         ).pack(side="left", padx=8)
 
 
+class UploadProgressDialog(ctk.CTkToplevel):
+    """Progress dialog for multi-file upload"""
+    
+    def __init__(self, parent, total_files: int):
+        super().__init__(parent)
+        
+        self.title("")
+        self.geometry("480x280")
+        self.configure(fg_color=M3.BG_ELEVATED)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", lambda: None)  # Disable close button
+        
+        # Center on parent
+        self.update()
+        x = parent.winfo_x() + (parent.winfo_width() - 480) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 280) // 2
+        self.geometry(f"+{x}+{y}")
+        
+        self.total_files = total_files
+        self.current_file = 0
+        self.successful = 0
+        self.failed = 0
+        
+        # Icon
+        ctk.CTkLabel(
+            self, text="🔐",
+            font=(M3.FONT_DISPLAY[0], 40)
+        ).pack(pady=(25, 15))
+        
+        # Title
+        self.title_label = ctk.CTkLabel(
+            self, text="Encrypting Files...",
+            font=(M3.FONT_DISPLAY[0], 20, "bold"),
+            text_color=M3.TEXT_PRIMARY
+        )
+        self.title_label.pack(pady=(0, 8))
+        
+        # Current file label
+        self.file_label = ctk.CTkLabel(
+            self, text="Preparing...",
+            font=(M3.FONT_BODY[0], 13),
+            text_color=M3.TEXT_SECONDARY,
+            wraplength=400
+        )
+        self.file_label.pack(pady=(0, 20))
+        
+        # Progress bar
+        self.progress = ctk.CTkProgressBar(
+            self,
+            width=380,
+            height=8,
+            corner_radius=4,
+            fg_color=M3.SURFACE_VARIANT,
+            progress_color=M3.PRIMARY
+        )
+        self.progress.pack(pady=(0, 12))
+        self.progress.set(0)
+        
+        # Progress text
+        self.progress_text = ctk.CTkLabel(
+            self, text=f"0 / {total_files} files",
+            font=(M3.FONT_BODY[0], 12),
+            text_color=M3.TEXT_TERTIARY
+        )
+        self.progress_text.pack()
+        
+        # Status (shown when complete)
+        self.status_frame = ctk.CTkFrame(self, fg_color="transparent")
+        
+    def update_progress(self, current: int, filename: str, success: bool = True):
+        """Update the progress display"""
+        self.current_file = current
+        if success:
+            self.successful += 1
+        else:
+            self.failed += 1
+        
+        progress_value = current / self.total_files
+        self.progress.set(progress_value)
+        self.file_label.configure(text=f"{'✓' if success else '✕'} {filename}")
+        self.progress_text.configure(text=f"{current} / {self.total_files} files")
+        self.update()
+    
+    def show_complete(self, on_close):
+        """Show completion status"""
+        self.title_label.configure(
+            text="Upload Complete!",
+            text_color=M3.SUCCESS if self.failed == 0 else M3.WARNING
+        )
+        
+        status_text = f"✓ {self.successful} files encrypted successfully"
+        if self.failed > 0:
+            status_text += f"\n✕ {self.failed} files failed"
+        
+        self.file_label.configure(
+            text=status_text,
+            text_color=M3.SUCCESS if self.failed == 0 else M3.TEXT_SECONDARY
+        )
+        
+        self.progress_text.pack_forget()
+        
+        # Add close button
+        ctk.CTkButton(
+            self, text="Done", width=120, height=40,
+            corner_radius=M3.RADIUS_MEDIUM,
+            fg_color=M3.PRIMARY,
+            hover_color=M3.PRIMARY_VARIANT,
+            text_color=M3.ON_PRIMARY,
+            font=(M3.FONT_BODY[0], 14, "bold"),
+            command=lambda: [on_close(), self.destroy()]
+        ).pack(pady=15)
+
+
+class DropZone(ctk.CTkFrame):
+    """Drag and drop zone for file uploads"""
+    
+    def __init__(self, master, on_click, **kwargs):
+        super().__init__(
+            master,
+            fg_color=M3.SURFACE,
+            corner_radius=M3.RADIUS_LARGE,
+            border_width=2,
+            border_color=M3.OUTLINE,
+            **kwargs
+        )
+        
+        self.on_click = on_click
+        self.default_border = M3.OUTLINE
+        self.hover_border = M3.PRIMARY
+        
+        # Make it clickable
+        self.bind("<Button-1>", lambda e: on_click())
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        
+        # Content container
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.pack(expand=True, pady=30)
+        content.bind("<Button-1>", lambda e: on_click())
+        
+        # Icon
+        icon_label = ctk.CTkLabel(
+            content, text="📁",
+            font=(M3.FONT_DISPLAY[0], 48)
+        )
+        icon_label.pack()
+        icon_label.bind("<Button-1>", lambda e: on_click())
+        
+        # Primary text
+        primary_label = ctk.CTkLabel(
+            content,
+            text="Click to upload files",
+            font=(M3.FONT_BODY[0], 16, "bold"),
+            text_color=M3.TEXT_PRIMARY
+        )
+        primary_label.pack(pady=(15, 5))
+        primary_label.bind("<Button-1>", lambda e: on_click())
+        
+        # Secondary text
+        secondary_label = ctk.CTkLabel(
+            content,
+            text="Select one or multiple files to encrypt",
+            font=(M3.FONT_BODY[0], 13),
+            text_color=M3.TEXT_TERTIARY
+        )
+        secondary_label.pack()
+        secondary_label.bind("<Button-1>", lambda e: on_click())
+        
+        # Supported formats
+        formats_label = ctk.CTkLabel(
+            content,
+            text="Images • Documents • Videos • Archives • Any file type",
+            font=(M3.FONT_BODY[0], 11),
+            text_color=M3.TEXT_DISABLED
+        )
+        formats_label.pack(pady=(15, 0))
+        formats_label.bind("<Button-1>", lambda e: on_click())
+    
+    def _on_enter(self, event):
+        self.configure(border_color=self.hover_border, fg_color=M3.SURFACE_VARIANT)
+    
+    def _on_leave(self, event):
+        self.configure(border_color=self.default_border, fg_color=M3.SURFACE)
+
+
+class PreviewPane(ctk.CTkFrame):
+    """Collapsible preview pane with close functionality"""
+    
+    def __init__(self, master, on_close, **kwargs):
+        super().__init__(
+            master,
+            width=400,
+            corner_radius=M3.RADIUS_LARGE,
+            fg_color=M3.SURFACE,
+            **kwargs
+        )
+        self.pack_propagate(False)
+        
+        self.on_close = on_close
+        self.current_file = None
+        
+        # Header
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=16, pady=(16, 0))
+        
+        # Title
+        ctk.CTkLabel(
+            header,
+            text="PREVIEW",
+            font=(M3.FONT_BODY[0], 11, "bold"),
+            text_color=M3.TEXT_TERTIARY
+        ).pack(side="left")
+        
+        # Close button
+        close_btn = ctk.CTkButton(
+            header,
+            text="✕",
+            width=32, height=32,
+            corner_radius=16,
+            fg_color="transparent",
+            hover_color=M3.SURFACE_VARIANT,
+            text_color=M3.TEXT_SECONDARY,
+            font=(M3.FONT_BODY[0], 16),
+            command=on_close
+        )
+        close_btn.pack(side="right")
+        
+        # Divider
+        ctk.CTkFrame(
+            self, height=1,
+            fg_color=M3.DIVIDER
+        ).pack(fill="x", padx=16, pady=12)
+        
+        # File info section
+        self.file_info_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.file_info_frame.pack(fill="x", padx=20)
+        
+        self.file_name_label = ctk.CTkLabel(
+            self.file_info_frame,
+            text="",
+            font=(M3.FONT_BODY[0], 14, "bold"),
+            text_color=M3.TEXT_PRIMARY,
+            wraplength=340
+        )
+        self.file_name_label.pack(anchor="w")
+        
+        self.file_meta_label = ctk.CTkLabel(
+            self.file_info_frame,
+            text="",
+            font=(M3.FONT_BODY[0], 12),
+            text_color=M3.TEXT_TERTIARY
+        )
+        self.file_meta_label.pack(anchor="w", pady=(2, 0))
+        
+        # Preview content area
+        self.preview_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.preview_container.pack(expand=True, fill="both", padx=16, pady=16)
+        
+        self.preview_content = ctk.CTkLabel(
+            self.preview_container,
+            text="Select a file to preview",
+            font=(M3.FONT_BODY[0], 14),
+            text_color=M3.TEXT_SECONDARY,
+            wraplength=340
+        )
+        self.preview_content.pack(expand=True)
+        
+        # Action buttons at bottom
+        self.action_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.action_frame.pack(fill="x", padx=16, pady=(0, 16))
+        
+        # Initially hide file info and actions
+        self.file_info_frame.pack_forget()
+        self.action_frame.pack_forget()
+    
+    def show_preview(self, path: Path, data: bytes = None, error: str = None):
+        """Display preview for a file"""
+        self.current_file = path
+        
+        # Show file info
+        self.file_info_frame.pack(fill="x", padx=20, before=self.preview_container)
+        self.file_name_label.configure(text=path.name)
+        
+        ext = path.suffix.lower()
+        size = format_file_size(path.stat().st_size)
+        self.file_meta_label.configure(text=f"{size}  •  {ext.upper()[1:] if ext else 'FILE'}")
+        
+        # Clear previous preview
+        self.preview_content.configure(image="", text="")
+        
+        if error:
+            self.preview_content.configure(
+                text=f"Preview error:\n{error}",
+                font=(M3.FONT_BODY[0], 14),
+                text_color=M3.ERROR
+            )
+            return
+        
+        if data is None:
+            self.preview_content.configure(
+                text="Loading preview...",
+                font=(M3.FONT_BODY[0], 14),
+                text_color=M3.TEXT_SECONDARY
+            )
+            return
+        
+        # Image preview
+        if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
+            try:
+                img = Image.open(io.BytesIO(data))
+                max_w, max_h = 340, 380
+                ratio = min(max_w / img.width, max_h / img.height)
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=new_size)
+                self.preview_content.configure(image=ctk_img, text="")
+            except Exception as e:
+                self.preview_content.configure(
+                    text=f"Could not load image:\n{str(e)}",
+                    font=(M3.FONT_BODY[0], 13),
+                    text_color=M3.ERROR
+                )
+        
+        # Text preview
+        elif ext in ['.txt', '.py', '.js', '.json', '.md', '.csv', '.html', '.css', '.xml', '.log', '.ini', '.yaml', '.yml']:
+            try:
+                text = data.decode('utf-8', errors='ignore')[:3000]
+                if len(data) > 3000:
+                    text += "\n\n... (truncated)"
+                self.preview_content.configure(
+                    image="",
+                    text=text,
+                    font=(M3.FONT_MONO[0], 11),
+                    text_color=M3.TEXT_PRIMARY,
+                    justify="left"
+                )
+            except Exception as e:
+                self.preview_content.configure(
+                    text=f"Could not read text:\n{str(e)}",
+                    font=(M3.FONT_BODY[0], 13),
+                    text_color=M3.ERROR
+                )
+        
+        # Unsupported format
+        else:
+            self.preview_content.configure(
+                image="",
+                text=f"Preview not available\nfor {ext.upper()} files\n\nClick 'Open' to view\nwith default application",
+                font=(M3.FONT_BODY[0], 14),
+                text_color=M3.TEXT_SECONDARY
+            )
+    
+    def clear_preview(self):
+        """Clear the preview and reset to default state"""
+        self.current_file = None
+        self.file_info_frame.pack_forget()
+        self.action_frame.pack_forget()
+        self.preview_content.configure(
+            image="",
+            text="Select a file to preview",
+            font=(M3.FONT_BODY[0], 14),
+            text_color=M3.TEXT_SECONDARY
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN APPLICATION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -654,6 +1069,7 @@ class VaultApp(ctk.CTk):
         self.is_unlocked = False
         self.current_tab = "files"
         self.last_activity = time.time()
+        self.preview_visible = settings.get("preview_visible", True)
         
         # Show login screen
         self.show_login()
@@ -927,39 +1343,50 @@ class VaultApp(ctk.CTk):
         self.content_area = ctk.CTkFrame(self.main_container, fg_color="transparent")
         self.content_area.pack(side="left", expand=True, fill="both")
         
-        # Preview pane
-        self.preview_pane = ctk.CTkFrame(
+        # Preview pane (collapsible)
+        self.preview_pane = PreviewPane(
             self.main_container,
-            width=400,
-            corner_radius=M3.RADIUS_LARGE,
-            fg_color=M3.SURFACE
+            on_close=self.toggle_preview
         )
-        self.preview_pane.pack(side="right", fill="y", padx=16, pady=16)
-        self.preview_pane.pack_propagate(False)
         
-        # Preview header
-        preview_header = ctk.CTkFrame(self.preview_pane, fg_color="transparent")
-        preview_header.pack(fill="x", padx=20, pady=20)
+        # Show/hide based on saved preference
+        if self.preview_visible:
+            self.preview_pane.pack(side="right", fill="y", padx=16, pady=16)
         
-        ctk.CTkLabel(
-            preview_header,
-            text="PREVIEW",
-            font=(M3.FONT_BODY[0], 11, "bold"),
-            text_color=M3.TEXT_TERTIARY
-        ).pack()
-        
-        # Preview content area
-        self.preview_content = ctk.CTkLabel(
-            self.preview_pane,
-            text="Select a file to preview",
-            font=(M3.FONT_BODY[0], 14),
-            text_color=M3.TEXT_SECONDARY,
-            wraplength=340
+        # Floating button to show preview (when hidden)
+        self.show_preview_btn = ctk.CTkButton(
+            self.main_container,
+            text="◀ Preview",
+            width=100, height=36,
+            corner_radius=18,
+            fg_color=M3.SURFACE,
+            hover_color=M3.SURFACE_VARIANT,
+            text_color=M3.TEXT_PRIMARY,
+            font=(M3.FONT_BODY[0], 12),
+            command=self.toggle_preview
         )
-        self.preview_content.pack(expand=True, padx=24)
+        
+        if not self.preview_visible:
+            self.show_preview_btn.place(relx=0.98, rely=0.5, anchor="e")
         
         # Load default tab
         self.set_tab("files")
+    
+    def toggle_preview(self):
+        """Toggle preview pane visibility"""
+        self.preview_visible = not self.preview_visible
+        settings.set("preview_visible", self.preview_visible)
+        
+        if self.preview_visible:
+            # Show preview pane
+            self.show_preview_btn.place_forget()
+            self.preview_pane.pack(side="right", fill="y", padx=16, pady=16)
+            self.show_toast("Preview panel opened", "info")
+        else:
+            # Hide preview pane
+            self.preview_pane.pack_forget()
+            self.show_preview_btn.place(relx=0.98, rely=0.5, anchor="e")
+            self.show_toast("Preview panel closed", "info")
     
     def set_tab(self, tab: str):
         self.current_tab = tab
@@ -974,6 +1401,10 @@ class VaultApp(ctk.CTk):
         # Clear content
         for widget in self.content_area.winfo_children():
             widget.destroy()
+        
+        # Clear preview when switching tabs
+        if hasattr(self, 'preview_pane'):
+            self.preview_pane.clear_preview()
         
         # Render tab content
         if tab == "files":
@@ -1018,54 +1449,94 @@ class VaultApp(ctk.CTk):
             text_color=M3.TEXT_TERTIARY
         ).pack(side="left", pady=(8, 0))
         
-        # Add button
+        # Action buttons
+        btn_frame = ctk.CTkFrame(header, fg_color="transparent")
+        btn_frame.pack(side="right")
+        
+        # Toggle preview button
+        preview_btn_text = "Hide Preview" if self.preview_visible else "Show Preview"
         ctk.CTkButton(
-            header,
-            text="+ Add File",
+            btn_frame,
+            text=f"👁 {preview_btn_text}",
+            width=130, height=44,
+            corner_radius=22,
+            fg_color=M3.SURFACE,
+            hover_color=M3.SURFACE_VARIANT,
+            text_color=M3.TEXT_PRIMARY,
+            font=(M3.FONT_BODY[0], 13),
+            command=self.toggle_preview
+        ).pack(side="left", padx=(0, 10))
+        
+        # Add multiple files button
+        ctk.CTkButton(
+            btn_frame,
+            text="+ Add Files",
             width=130, height=44,
             corner_radius=22,
             fg_color=M3.PRIMARY,
             hover_color=M3.PRIMARY_VARIANT,
             text_color=M3.ON_PRIMARY,
             font=(M3.FONT_BODY[0], 14, "bold"),
-            command=self._upload_file
-        ).pack(side="right")
+            command=self._upload_files
+        ).pack(side="left", padx=(0, 10))
         
-        # File list
-        scroll = ctk.CTkScrollableFrame(
-            self.content_area,
-            fg_color="transparent",
-            scrollbar_button_color=M3.SURFACE_VARIANT,
-            scrollbar_button_hover_color=M3.SURFACE_BRIGHT
-        )
-        scroll.pack(expand=True, fill="both", padx=20, pady=(0, 20))
+        # Add folder button
+        ctk.CTkButton(
+            btn_frame,
+            text="📁 Add Folder",
+            width=130, height=44,
+            corner_radius=22,
+            fg_color=M3.SECONDARY_CONTAINER,
+            hover_color=M3.SECONDARY,
+            text_color=M3.TEXT_PRIMARY,
+            font=(M3.FONT_BODY[0], 14, "bold"),
+            command=self._upload_folder
+        ).pack(side="left")
         
         files = list(VAULT_DIR.iterdir())
         
+        # Show drop zone if no files, otherwise show file list
         if not files:
-            # Empty state
-            empty_frame = ctk.CTkFrame(scroll, fg_color="transparent")
-            empty_frame.pack(expand=True, pady=80)
-            
-            ctk.CTkLabel(
-                empty_frame, text="📂",
-                font=(M3.FONT_DISPLAY[0], 64)
-            ).pack()
-            
-            ctk.CTkLabel(
-                empty_frame,
-                text="No files yet",
-                font=(M3.FONT_BODY[0], 18, "bold"),
-                text_color=M3.TEXT_SECONDARY
-            ).pack(pady=(20, 8))
-            
-            ctk.CTkLabel(
-                empty_frame,
-                text="Click '+ Add File' to encrypt and store files securely",
-                font=(M3.FONT_BODY[0], 14),
-                text_color=M3.TEXT_TERTIARY
-            ).pack()
+            # Drop zone for empty state
+            drop_zone = DropZone(
+                self.content_area,
+                on_click=self._upload_files
+            )
+            drop_zone.pack(expand=True, fill="both", padx=32, pady=(10, 32))
         else:
+            # Compact drop zone
+            compact_drop = ctk.CTkFrame(
+                self.content_area,
+                fg_color=M3.SURFACE,
+                corner_radius=M3.RADIUS_MEDIUM,
+                height=70
+            )
+            compact_drop.pack(fill="x", padx=32, pady=(0, 15))
+            compact_drop.pack_propagate(False)
+            compact_drop.bind("<Button-1>", lambda e: self._upload_files())
+            compact_drop.bind("<Enter>", lambda e: compact_drop.configure(fg_color=M3.SURFACE_VARIANT))
+            compact_drop.bind("<Leave>", lambda e: compact_drop.configure(fg_color=M3.SURFACE))
+            
+            drop_content = ctk.CTkFrame(compact_drop, fg_color="transparent")
+            drop_content.place(relx=0.5, rely=0.5, anchor="center")
+            drop_content.bind("<Button-1>", lambda e: self._upload_files())
+            
+            ctk.CTkLabel(
+                drop_content,
+                text="📁  Click to add more files",
+                font=(M3.FONT_BODY[0], 14),
+                text_color=M3.TEXT_SECONDARY
+            ).pack(side="left")
+            
+            # File list
+            scroll = ctk.CTkScrollableFrame(
+                self.content_area,
+                fg_color="transparent",
+                scrollbar_button_color=M3.SURFACE_VARIANT,
+                scrollbar_button_hover_color=M3.SURFACE_BRIGHT
+            )
+            scroll.pack(expand=True, fill="both", padx=20, pady=(0, 20))
+            
             # Sort by modification time (newest first)
             for file_path in sorted(files, key=lambda x: x.stat().st_mtime, reverse=True):
                 FileCard(
@@ -1076,66 +1547,135 @@ class VaultApp(ctk.CTk):
                     on_delete=self._delete_file
                 ).pack(fill="x", pady=6, padx=12)
     
-    def _upload_file(self):
-        file_path = filedialog.askopenfilename(
-            title="Select file to encrypt",
+    def _upload_files(self):
+        """Upload multiple files with progress dialog"""
+        file_paths = filedialog.askopenfilenames(
+            title="Select files to encrypt",
             filetypes=[
                 ("All files", "*.*"),
-                ("Images", "*.jpg *.jpeg *.png *.gif *.bmp"),
-                ("Documents", "*.txt *.pdf *.doc *.docx"),
-                ("Code", "*.py *.js *.html *.css *.json")
+                ("Images", "*.jpg *.jpeg *.png *.gif *.bmp *.webp"),
+                ("Documents", "*.txt *.pdf *.doc *.docx *.rtf"),
+                ("Videos", "*.mp4 *.mov *.avi *.mkv *.webm"),
+                ("Audio", "*.mp3 *.wav *.flac *.aac *.ogg"),
+                ("Archives", "*.zip *.rar *.7z *.tar *.gz"),
+                ("Code", "*.py *.js *.html *.css *.json *.xml *.md")
             ]
         )
         
-        if file_path:
+        if not file_paths:
+            return
+        
+        # Start upload in background thread
+        threading.Thread(
+            target=self._process_file_uploads,
+            args=(file_paths,),
+            daemon=True
+        ).start()
+    
+    def _upload_folder(self):
+        """Upload all files from a selected folder"""
+        folder_path = filedialog.askdirectory(title="Select folder to encrypt")
+        
+        if not folder_path:
+            return
+        
+        # Get all files in folder (non-recursive)
+        folder = Path(folder_path)
+        file_paths = [str(f) for f in folder.iterdir() if f.is_file()]
+        
+        if not file_paths:
+            self.show_toast("No files found in selected folder", "warning")
+            return
+        
+        # Start upload in background thread
+        threading.Thread(
+            target=self._process_file_uploads,
+            args=(tuple(file_paths),),
+            daemon=True
+        ).start()
+    
+    def _process_file_uploads(self, file_paths: tuple):
+        """Process multiple file uploads with progress tracking"""
+        total_files = len(file_paths)
+        
+        # Create progress dialog on main thread
+        self.after(0, lambda: self._show_upload_progress(total_files))
+        
+        # Small delay to ensure dialog is created
+        time.sleep(0.1)
+        
+        successful = 0
+        failed = 0
+        
+        for i, file_path in enumerate(file_paths, 1):
+            filename = os.path.basename(file_path)
+            
             try:
-                dest = VAULT_DIR / os.path.basename(file_path)
+                # Check if file already exists
+                dest = VAULT_DIR / filename
+                
+                # Handle duplicate filenames
+                if dest.exists():
+                    name, ext = os.path.splitext(filename)
+                    counter = 1
+                    while dest.exists():
+                        dest = VAULT_DIR / f"{name}_{counter}{ext}"
+                        counter += 1
+                
+                # Encrypt and save
                 crypto.encrypt_file(file_path, str(dest))
-                self.show_toast("File encrypted and secured!", "success")
-                self.set_tab("files")
+                successful += 1
+                
+                # Update progress
+                self.after(0, lambda i=i, fn=filename: self._update_upload_progress(i, fn, True))
+                
             except Exception as e:
-                self.show_toast(f"Error: {str(e)}", "error")
+                failed += 1
+                self.after(0, lambda i=i, fn=filename: self._update_upload_progress(i, fn, False))
+            
+            # Small delay between files for UI responsiveness
+            time.sleep(0.05)
+        
+        # Show completion
+        self.after(0, lambda: self._complete_upload(successful, failed))
+    
+    def _show_upload_progress(self, total_files: int):
+        """Show the upload progress dialog"""
+        self.upload_dialog = UploadProgressDialog(self, total_files)
+    
+    def _update_upload_progress(self, current: int, filename: str, success: bool):
+        """Update the upload progress dialog"""
+        if hasattr(self, 'upload_dialog') and self.upload_dialog.winfo_exists():
+            self.upload_dialog.update_progress(current, filename, success)
+    
+    def _complete_upload(self, successful: int, failed: int):
+        """Complete the upload process"""
+        if hasattr(self, 'upload_dialog') and self.upload_dialog.winfo_exists():
+            self.upload_dialog.show_complete(lambda: self.set_tab("files"))
+        else:
+            # Dialog was closed, just refresh
+            self.set_tab("files")
+            
+        if successful > 0:
+            msg = f"{successful} file{'s' if successful > 1 else ''} encrypted successfully"
+            if failed > 0:
+                msg += f" ({failed} failed)"
+            self.show_toast(msg, "success" if failed == 0 else "warning")
     
     def _show_file_preview(self, path: Path):
+        """Show file preview in the preview pane"""
+        # Ensure preview pane is visible
+        if not self.preview_visible:
+            self.toggle_preview()
+        
         try:
             with open(path, "rb") as f:
                 data = crypto.decrypt(f.read())
             
-            ext = path.suffix.lower()
+            self.preview_pane.show_preview(path, data)
             
-            # Image preview
-            if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
-                img = Image.open(io.BytesIO(data))
-                max_w, max_h = 340, 440
-                ratio = min(max_w / img.width, max_h / img.height)
-                new_size = (int(img.width * ratio), int(img.height * ratio))
-                
-                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=new_size)
-                self.preview_content.configure(image=ctk_img, text="")
-            
-            # Text preview
-            elif ext in ['.txt', '.py', '.js', '.json', '.md', '.csv', '.html', '.css', '.xml']:
-                text = data.decode('utf-8', errors='ignore')[:3000]
-                self.preview_content.configure(
-                    image="",
-                    text=text,
-                    font=(M3.FONT_MONO[0], 11),
-                    justify="left"
-                )
-            
-            # Unsupported format
-            else:
-                self.preview_content.configure(
-                    image="",
-                    text=f"Preview not available\nfor {ext.upper()} files\n\nClick 'Open' to view",
-                    font=(M3.FONT_BODY[0], 14)
-                )
-                
         except Exception as e:
-            self.preview_content.configure(
-                image="",
-                text=f"Preview error:\n{str(e)}"
-            )
+            self.preview_pane.show_preview(path, error=str(e))
     
     def _open_file(self, path: Path):
         try:
@@ -1149,6 +1689,7 @@ class VaultApp(ctk.CTk):
         def on_confirm():
             secure_delete(path)
             self.show_toast("File securely shredded", "success")
+            self.preview_pane.clear_preview()
             self.set_tab("files")
         
         ConfirmDialog(
@@ -1537,7 +2078,7 @@ class VaultApp(ctk.CTk):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SPLASH SCREEN (Optional - for a polished feel)
+# SPLASH SCREEN
 # ══════════════════════════════════════════════════════════════════════════════
 class SplashScreen(ctk.CTkToplevel):
     """Loading splash screen shown at startup"""
@@ -1549,7 +2090,7 @@ class SplashScreen(ctk.CTkToplevel):
         self.title("")
         self.geometry("400x300")
         self.configure(fg_color=M3.BG)
-        self.overrideredirect(True)  # Remove window decorations
+        self.overrideredirect(True)
         self.resizable(False, False)
         
         # Center on screen
@@ -1611,7 +2152,7 @@ def main():
     # Create and run application
     app = VaultApp()
     
-    # Show splash screen (optional - comment out if not needed)
+    # Show splash screen (optional - uncomment if desired)
     # splash = SplashScreen(app)
     # app.wait_window(splash)
     
