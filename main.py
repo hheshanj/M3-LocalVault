@@ -11,18 +11,27 @@ import shutil
 import logging
 import hashlib
 import base64
+import platform
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Callable, Dict, List, Tuple, Any
 from dataclasses import dataclass, asdict
 from logging.handlers import RotatingFileHandler
-from deepface import DeepFace
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import customtkinter as ctk
-from tkinter import filedialog
-from PIL import Image
+
+# Third-party imports
+try:
+    from deepface import DeepFace
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    import customtkinter as ctk
+    from tkinter import filedialog
+    from PIL import Image
+except ImportError as e:
+    print(f"CRITICAL ERROR: Missing required libraries. \nError: {e}")
+    print("Please run: pip install customtkinter deepface cryptography opencv-python pillow tf-keras")
+    exit(1)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION & ENVIRONMENT
@@ -31,7 +40,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 APP_NAME = "M3-VAULT"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION MANAGEMENT
@@ -63,7 +72,9 @@ class AppConfig:
             try:
                 with open(config_file) as f:
                     data = json.load(f)
-                    return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
+                    # Filter keys that exist in the dataclass
+                    valid_keys = {k: v for k, v in data.items() if k in cls.__annotations__}
+                    return cls(**valid_keys)
             except Exception:
                 pass
         return cls()
@@ -97,19 +108,22 @@ def setup_logging() -> logging.Logger:
         return logger
     
     # File handler with rotation (10MB max, 5 backups)
-    file_handler = RotatingFileHandler(
-        config.log_file,
-        maxBytes=10*1024*1024,
-        backupCount=5
-    )
-    file_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    ))
-    logger.addHandler(file_handler)
+    try:
+        file_handler = RotatingFileHandler(
+            config.log_file,
+            maxBytes=10*1024*1024,
+            backupCount=5
+        )
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
+        logger.addHandler(file_handler)
+    except Exception as e:
+        print(f"Failed to setup file logging: {e}")
     
     # Console handler for development
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)
+    console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter('%(levelname)s - %(message)s'))
     logger.addHandler(console_handler)
     
@@ -383,7 +397,9 @@ def generate_password(
         password.append(secrets.choice(symbols))
     
     # Fill remaining length
-    password.extend(secrets.choice(chars) for _ in range(length - len(password)))
+    remaining = length - len(password)
+    if remaining > 0:
+        password.extend(secrets.choice(chars) for _ in range(remaining))
     
     # Shuffle to avoid predictable patterns
     secrets.SystemRandom().shuffle(password)
@@ -398,15 +414,19 @@ def secure_delete(path: Path, passes: Optional[int] = None) -> None:
         return
     
     passes = passes if passes is not None else config.secure_delete_passes
-    size = path.stat().st_size
+    try:
+        size = path.stat().st_size
+    except Exception:
+        size = 0
     
     try:
-        with open(path, "r+b") as f:
-            for i in range(passes):
-                f.seek(0)
-                f.write(os.urandom(size))
-                f.flush()
-                os.fsync(f.fileno())
+        if size > 0:
+            with open(path, "r+b") as f:
+                for i in range(passes):
+                    f.seek(0)
+                    f.write(os.urandom(size))
+                    f.flush()
+                    os.fsync(f.fileno())
         path.unlink()
         logger.info(f"Securely deleted: {path}")
     except Exception as e:
@@ -438,11 +458,25 @@ def cleanup_temp_directory() -> None:
     if temp_path.exists():
         try:
             for file in temp_path.iterdir():
-                secure_delete(file, passes=1)  # Quick wipe on exit
+                try:
+                    secure_delete(file, passes=1)  # Quick wipe on exit
+                except Exception:
+                    pass
             logger.info("Temp directory cleaned up")
         except Exception as e:
             logger.error(f"Cleanup failed: {e}")
 
+def open_file_cross_platform(path: str):
+    """Open file using default application safely on any OS"""
+    try:
+        if platform.system() == 'Darwin':       # macOS
+            subprocess.call(('open', path))
+        elif platform.system() == 'Windows':    # Windows
+            os.startfile(path)
+        else:                                   # linux variants
+            subprocess.call(('xdg-open', path))
+    except Exception as e:
+        logger.error(f"Failed to open file cross-platform: {e}")
 
 atexit.register(cleanup_temp_directory)
 
@@ -535,13 +569,13 @@ class FileCard(ctk.CTkFrame):
     """Modern file card with metadata and actions"""
     
     FILE_ICONS = {
-        'image': ('🖼️', ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg']),
-        'document': ('📄', ['.txt', '.pdf', '.doc', '.docx', '.rtf']),
-        'code': ('💻', ['.py', '.js', '.html', '.css', '.json', '.xml', '.md']),
-        'video': ('🎬', ['.mp4', '.mov', '.avi', '.mkv', '.webm']),
-        'audio': ('🎵', ['.mp3', '.wav', '.flac', '.aac', '.ogg']),
-        'archive': ('📦', ['.zip', '.rar', '.7z', '.tar', '.gz']),
-        'default': ('📎', [])
+        'image': (' 🖼️', ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg']),
+        'document': (' 📄', ['.txt', '.pdf', '.doc', '.docx', '.rtf']),
+        'code': (' 💻', ['.py', '.js', '.html', '.css', '.json', '.xml', '.md']),
+        'video': (' 🎬', ['.mp4', '.mov', '.avi', '.mkv', '.webm']),
+        'audio': (' 🎵', ['.mp3', '.wav', '.flac', '.aac', '.ogg']),
+        'archive': (' 📦', ['.zip', '.rar', '.7z', '.tar', '.gz']),
+        'default': (' 📎', [])
     }
     
     def __init__(self, master, file_path: Path, on_preview, on_open, on_delete, **kwargs):
@@ -553,7 +587,10 @@ class FileCard(ctk.CTkFrame):
         
         ext = file_path.suffix.lower()
         icon = self._get_file_icon(ext)
-        size = format_file_size(file_path.stat().st_size)
+        try:
+            size = format_file_size(file_path.stat().st_size)
+        except:
+            size = "Unknown"
         
         # Main container
         container = ctk.CTkFrame(self, fg_color="transparent")
@@ -1167,7 +1204,10 @@ class PreviewPane(ctk.CTkFrame):
         self.file_name_label.configure(text=path.name)
         
         ext = path.suffix.lower()
-        size = format_file_size(path.stat().st_size)
+        try:
+            size = format_file_size(path.stat().st_size)
+        except:
+            size = "Unknown"
         self.file_meta_label.configure(text=f"{size}  •  {ext.upper()[1:] if ext else 'FILE'}")
         
         # Clear previous preview
@@ -1256,7 +1296,7 @@ class VaultApp(ctk.CTk):
         
         # Window setup
         self.title(APP_NAME)
-        self.geometry("1350x850")
+        self.geometry("1350x700")
         self.configure(fg_color=M3.BG)
         self.minsize(1100, 700)
         
@@ -1426,7 +1466,7 @@ class VaultApp(ctk.CTk):
                         if not cap.isOpened():
                             raise RuntimeError("Camera not available")
                         
-                        time.sleep(0.5)
+                        time.sleep(1.0) # wait for camera to warmup
                         ret, frame = cap.read()
                         
                         if not ret:
@@ -1574,7 +1614,7 @@ class VaultApp(ctk.CTk):
                 if not cap.isOpened():
                     raise RuntimeError("Camera not available")
                 
-                time.sleep(0.3)
+                time.sleep(1.0) # Wait for camera adjustment
                 ret, frame = cap.read()
                 
                 if not ret:
@@ -1583,9 +1623,14 @@ class VaultApp(ctk.CTk):
                 temp_img = Path(config.temp_dir) / f"auth_{int(time.time())}.jpg"
                 cv2.imwrite(str(temp_img), frame)
                 
+                # Release camera before running deepface heavy computation
+                cap.release()
+                cv2.destroyAllWindows()
+                cap = None
+
                 result = DeepFace.verify(
                     str(temp_img), config.master_face,
-                    enforce_detection=True,
+                    enforce_detection=False, # Relaxed for better UX
                     detector_backend='opencv',
                     model_name='VGG-Face'
                 )
@@ -1599,7 +1644,10 @@ class VaultApp(ctk.CTk):
                 else:
                     # Log intruder
                     intruder_file = Path(config.intruder_dir) / f"intruder_{int(time.time())}.jpg"
+                    # Wait briefly to ensure file handle is released
+                    time.sleep(0.1)
                     shutil.copy(temp_img, intruder_file)
+                    
                     logger.warning("Intruder detected and logged")
                     self.after(0, lambda: self.show_toast("Access Denied • Intruder logged", "error"))
                     self.after(0, self._reset_auth_button)
@@ -1617,7 +1665,6 @@ class VaultApp(ctk.CTk):
             finally:
                 if cap:
                     cap.release()
-                cv2.destroyAllWindows()
                 
                 if temp_img and temp_img.exists():
                     try:
@@ -1637,8 +1684,9 @@ class VaultApp(ctk.CTk):
         def on_confirm():
             try:
                 # Delete all vault data
-                for file in Path(config.vault_dir).iterdir():
-                    secure_delete(file, passes=1)
+                if os.path.exists(config.vault_dir):
+                    for file in Path(config.vault_dir).iterdir():
+                        secure_delete(file, passes=1)
                 
                 # Delete auth files
                 for file in [config.master_face, config.master_pin_hash, config.key_file, 
@@ -1704,7 +1752,7 @@ class VaultApp(ctk.CTk):
         nav_items = [
             ("files", "📁", "Files"),
             ("passwords", "🔑", "Passwords"),
-            ("security", "🛡️", "Security"),
+            ("security", "    🛡️", "Security"),
         ]
         
         for key, icon, label in nav_items:
@@ -2042,7 +2090,9 @@ class VaultApp(ctk.CTk):
         try:
             temp_path = Path(config.temp_dir) / f"view_{int(time.time())}_{path.name}"
             crypto.decrypt_file(str(path), str(temp_path))
-            os.startfile(str(temp_path))
+            
+            # Use cross-platform opener
+            open_file_cross_platform(str(temp_path))
             
             # Schedule cleanup after 5 minutes
             def cleanup():
@@ -2228,23 +2278,26 @@ class VaultApp(ctk.CTk):
             self.show_toast(f"Error saving: {str(e)}", "error")
     
     def _copy_to_clipboard(self, text: str) -> None:
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        self.update()
-        self.show_toast("Password copied to clipboard!", "success")
-        
-        # Auto-clear after timeout
-        def clear_clipboard():
-            try:
-                current = self.clipboard_get()
-                if current == text:
-                    self.clipboard_clear()
-                    self.clipboard_append("")
-            except:
-                pass
-        
-        timeout = (settings.get("clipboard_timeout") or 30) * 1000
-        self.after(timeout, clear_clipboard)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            self.show_toast("Password copied to clipboard!", "success")
+            
+            # Auto-clear after timeout
+            def clear_clipboard():
+                try:
+                    current = self.clipboard_get()
+                    if current == text:
+                        self.clipboard_clear()
+                        self.clipboard_append("")
+                except:
+                    pass
+            
+            timeout = (settings.get("clipboard_timeout") or 30) * 1000
+            self.after(timeout, clear_clipboard)
+        except Exception as e:
+             self.show_toast(f"Clipboard error: {str(e)}", "error")
     
     def _delete_password(self, service: str) -> None:
         def on_confirm():
@@ -2324,7 +2377,7 @@ class VaultApp(ctk.CTk):
         stats_inner.pack(fill="x", padx=24, pady=20)
         
         stats_data = [
-            ("🛡️", "Vault Status", "Secured" if self.is_unlocked else "Locked", M3.SUCCESS),
+            ("    🛡️", "Vault Status", "Secured" if self.is_unlocked else "Locked", M3.SUCCESS),
             ("📁", "Protected Files", str(len(list(Path(config.vault_dir).iterdir()))), M3.PRIMARY),
             ("🔑", "Saved Passwords", str(len(self._load_passwords())), M3.SECONDARY),
             ("🚨", "Intrusion Attempts", str(intruder_count), M3.ERROR if intruder_count > 0 else M3.TEXT_TERTIARY)
@@ -2405,7 +2458,7 @@ class VaultApp(ctk.CTk):
     
     def _view_intruder(self, path: Path) -> None:
         try:
-            os.startfile(str(path))
+            open_file_cross_platform(str(path))
         except Exception as e:
             logger.error(f"Failed to open intruder image: {e}")
             self.show_toast(f"Error opening image: {str(e)}", "error")
@@ -2464,6 +2517,7 @@ def main():
         
     except Exception as e:
         logger.critical(f"Application crashed: {e}", exc_info=True)
+        print(f"CRITICAL ERROR: {e}")
         raise
 
 
