@@ -30,7 +30,7 @@
 
 1.  **Clone the Repository:**
     ```bash
-    git clone [https://github.com/yourusername/m3-vault.git](https://github.com/yourusername/m3-vault.git)
+    git clone https://github.com/hheshanj/M3-LocalVault
     cd m3-vault
     ```
 
