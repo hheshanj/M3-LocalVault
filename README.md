@@ -30,8 +30,10 @@
 
 1.  **Clone the Repository:**
     ```bash
-    git clone https://github.com/hheshanj/M3-LocalVault
-    cd m3-vault
+    git clone    https://github.com/hheshanj/M3-LocalVault
+    ```
+    ```bash
+    cd M3-LocalVault
     ```
 
 2.  **Install Dependencies:**
